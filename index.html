@@ -232,6 +232,9 @@
   .pbtn .p{font-size:34px;line-height:1}
   .movelist{max-height:230px;overflow-y:auto;font-size:13px}
   .mrow{display:grid;grid-template-columns:34px 1fr 1fr;gap:4px;align-items:center}
+  .qrow{display:grid;grid-template-columns:1fr auto;gap:4px 12px;align-items:center;padding:10px 0;border-top:1px solid var(--line)}
+  .qrow:first-child{border-top:0}
+  .qrow .btn{grid-column:2;grid-row:1 / span 2}
   .mno{color:var(--faint);font-variant-numeric:tabular-nums;font-size:12px}
   .mply{background:none;border:0;color:var(--ink);font:inherit;text-align:left;
     padding:3px 7px;border-radius:5px;cursor:pointer;position:relative}
@@ -369,6 +372,8 @@
               title="Queue your reply while the opponent is thinking">Premove off</button>
       <button class="btn" id="gnudge" type="button" aria-pressed="true"
               title="In Coach mode, ask before a move that leaves a piece to be taken">Warnings on</button>
+      <button class="btn hidden" id="gbook" type="button" aria-pressed="true"
+              title="In the opening the bot answers the way your real opponents did, as often as they did">Book on</button>
       <span class="msg" id="gsanmsg" role="status"></span>
     </form>
   </div>
@@ -525,6 +530,7 @@
       <div class="row">
         <button class="btn" id="eback">&larr; Back</button>
         <button class="btn" id="ereset">Start</button>
+        <button class="btn primary" id="eplay" title="Play this position against the bot, as the colour you are studying">Play from here</button>
       </div>
     </div>
   </div>
@@ -551,6 +557,11 @@
 <!-- ============ WEAK SPOTS ============ -->
 <section id="tab-weak" class="hidden">
   <div class="card">
+    <h2>Sparring queue</h2>
+    <p class="muted" style="margin:-4px 0 12px" id="wqnote"></p>
+    <div id="wqueue"></div>
+  </div>
+  <div class="card">
     <h2>Where you bleed points</h2>
     <p class="muted" style="margin:-4px 0 14px">
       Positions you land in often and score badly from, as <b id="wside">Black</b>.
@@ -562,7 +573,7 @@
     </div>
     <table>
       <thead><tr>
-        <th>Line</th><th class="num">Games</th><th class="num">Score</th><th class="num">vs. your average</th>
+        <th>Line</th><th class="num">Games</th><th class="num">Score</th><th class="num">vs. your average</th><th></th>
       </tr></thead>
       <tbody id="wbody"></tbody>
     </table>
@@ -580,6 +591,9 @@
         <button class="btn primary" id="pshow">Show me</button>
         <button class="btn" id="pnext" aria-label="Next position">&rarr;</button>
       </div>
+    </div>
+    <div class="row" style="margin-top:10px">
+      <button class="btn" id="pplay" title="Play this position out against the bot">Play from here</button>
     </div>
     <div class="card" style="margin-top:14px">
       <h2 id="pextitle">This position</h2>
@@ -2279,7 +2293,7 @@ function parseEntry(text, legal){
 /* ------------------------------------------------------------ prefs + sound */
 
 const LS = "chess-trainer-feel";
-const prefs = {sound: true, premove: false, nudge: true};
+const prefs = {sound: true, premove: false, nudge: true, book: true};
 try { Object.assign(prefs, JSON.parse(localStorage.getItem(LS)) || {}); } catch(e){ /* node, or blocked */ }
 function setPref(k, v){
   prefs[k] = v;
@@ -2390,6 +2404,13 @@ const RESULT = (rec) => rec.outcome === "draw" ? "1/2-1/2"
   : ((rec.outcome === "win") === (rec.mine === "w") ? "1-0" : "0-1");
 const NAG = {blunder: "$4", mistake: "$2", inacc: "$6"};
 
+/** Plies played before `fen` (a game begun from a position): 0 for the start
+ *  position, so ply index + this gives the move number and whose move it was. */
+function startPly(fen){
+  const f = String(fen || "").split(" ");
+  return f.length < 2 ? 0 : (Math.max(1, +f[5] || 1) - 1) * 2 + (f[1] === "b" ? 1 : 0);
+}
+
 function pgn(rec){
   const bot = `${rec.bot} bot (${rec.elo})`;
   const tags = [
@@ -2403,13 +2424,16 @@ function pgn(rec){
     ["Termination", rec.why || "?"],
   ];
   if(rec.from) tags.push(["Annotator", "replayed from an earlier game"]);
-  const words = [];
-  rec.moves.forEach((san, ply) => {
+  if(rec.fen) tags.push(["SetUp", "1"], ["FEN", rec.fen]);
+  const words = [], at = startPly(rec.fen);
+  rec.moves.forEach((san, i) => {
+    const ply = at + i;
     if(ply % 2 === 0) words.push(`${ply / 2 + 1}.`);
+    else if(i === 0) words.push(`${(ply + 1) / 2}...`);
     words.push(san);
-    const tag = rec.tags && rec.tags[ply];
+    const tag = rec.tags && rec.tags[i];
     if(tag) words.push(NAG[tag]);
-    if((rec.slips || []).includes(ply)) words.push("{bot slip}");
+    if((rec.slips || []).includes(i)) words.push("{bot slip}");
   });
   words.push(RESULT(rec));
   const lines = [];
@@ -2433,11 +2457,88 @@ function parsePgn(text){
           result: words.find(w => results.includes(w)) || headers.Result || "*"};
 }
 
-return {winProb, moveAccuracy, accuracy, evalWords, keyMoments, punished, pgn, parsePgn, MATE};
+return {winProb, moveAccuracy, accuracy, evalWords, keyMoments, punished, pgn, parsePgn, startPly, MATE};
 })();
 
 if(typeof window !== "undefined") window.Review = Review;
 if(typeof module !== "undefined" && module.exports) module.exports = Review;
+</script>
+<script>/* Spar: the bot's opening book — what your real opponents answered, as often
+ * as they answered it — and the spaced-repetition queue for your weak lines.
+ * Pure: the tree, the random source and the clock are all handed in. */
+const Spar = (function(){
+"use strict";
+
+const MIN_BOOK = 8;               // replies seen in a position before they count as a book
+const QUEUE_N = 8;                // weak lines queued per colour
+const WEAK_MIN = 25;              // games through a position before it can be called weak
+const STEPS = [1, 3, 7, 14, 30];  // days until a line comes back, by box
+const DAY = 86400000;
+
+/* ------------------------------------------------------------ book */
+
+/** One reply drawn from `pos[key].mv` in proportion to how often it was played.
+ *  null when the position is unknown or too thin to imitate. */
+function bookMove(pos, key, rng){
+  const nd = pos && pos[key];
+  if(!nd || !Array.isArray(nd.mv) || !nd.mv.length) return null;
+  const total = nd.mv.reduce((s, m) => s + m.n, 0);
+  if(total < MIN_BOOK) return null;
+  let r = rng() * total;
+  for(const m of nd.mv){ r -= m.n; if(r < 0) return {uci: m.uci, san: m.san, n: m.n, total}; }
+  const m = nd.mv[nd.mv.length - 1];
+  return {uci: m.uci, san: m.san, n: m.n, total};
+}
+
+/* ------------------------------------------------------------ weak lines */
+
+/** Positions you land in after your own move, often, and score worst from.
+ *  The Weak spots table and the queue both read this, so they cannot disagree. */
+function weakLines(pos, me, raw){
+  const rows = [];
+  for(const key in pos){
+    if(key.split(" ")[1] === me) continue;
+    const nd = pos[key];
+    if(nd.n < WEAK_MIN || !nd.line.length) continue;
+    rows.push({key, nd, s: raw(nd)});
+  }
+  return rows.sort((a, b) => a.s - b.s || (a.key < b.key ? -1 : 1));
+}
+
+/* ------------------------------------------------------------ queue */
+
+/** Bring the queue in step with today's weak lines: new ones are due now, known
+ *  ones keep their box and date, lines that are no longer weak drop out. */
+function sync(queue, lines, side, now){
+  const old = {};
+  (Array.isArray(queue) ? queue : []).forEach(q => { if(q && q.key && q.side) old[q.side + "|" + q.key] = q; });
+  const mine = lines.slice(0, QUEUE_N).map(r =>
+    old[side + "|" + r.key] || {key: r.key, side, box: 0, due: now, seen: 0, last: null});
+  const others = Object.values(old).filter(q => q.side !== side);
+  return others.concat(mine);
+}
+
+/** A sparring game from this line just ended. Win: a box up, back later. Loss:
+ *  box 0, back tomorrow. Draw: same box. */
+function grade(item, outcome, now){
+  const top = STEPS.length - 1;
+  const box = outcome === "win" ? Math.min(item.box + 1, top) : outcome === "loss" ? 0 : Math.min(Math.max(item.box, 0), top);
+  return Object.assign({}, item, {box, due: now + STEPS[box] * DAY, seen: (item.seen || 0) + 1, last: outcome});
+}
+
+const due = (queue, side, now) => queue.filter(q => q.side === side && q.due <= now).sort((a, b) => a.due - b.due || a.box - b.box);
+
+/** "today", "tomorrow", "in 6 days" */
+function when(item, now){
+  const d = Math.ceil((item.due - now) / DAY);
+  return d <= 0 ? "today" : d === 1 ? "tomorrow" : `in ${d} days`;
+}
+
+return {bookMove, weakLines, sync, grade, due, when, MIN_BOOK, QUEUE_N, WEAK_MIN, STEPS, DAY};
+})();
+
+if(typeof window !== "undefined") window.Spar = Spar;
+if(typeof module !== "undefined" && module.exports) module.exports = Spar;
 </script>
 <script>/* The coach. Explains what a move did and what to aim for instead.
  *
@@ -2741,7 +2842,7 @@ async function review(state, rec){
   if(S.mode === "coach") setEvalBar(S.evals[ply]);
 
   const hang = hangDetail(rec.after, me, replyUci);
-  const tip = principleTip(rec.after, me, ply + 1);
+  const tip = principleTip(rec.after, me, ply + 1 + (S.start && window.Review ? Review.startPly(S.start) : 0));
 
   /* Order matters. Dropping material is always worth saying, whatever the book
      thinks. Otherwise, inside your own repertoire your results beat a shallow
@@ -2884,6 +2985,9 @@ const S = {
   takebacks: 0,
   id: null, startedAt: null,
   from: null,          // {id, ply} when this game was replayed out of the history
+  start: null,         // FEN this game began from, when it was not the start position
+  spar: null,          // {key, side} — the weak line this game is sparring, graded when it ends
+  book: 0,             // bot moves taken from your opponents' real replies, not the engine
   cur: null,           // keyboard cursor square, shown only while the board has focus
   premove: null,       // {from, to} queued during the bot's turn (option, off by default)
   ask: null,           // {spec, warn} — a move waiting on "that hangs a piece — sure?"
@@ -2918,13 +3022,15 @@ function persist(){
     id: S.id, startedAt: S.startedAt, mine: S.mine, flip: S.flip,
     moves: S.game.history().map(uciOf), notes: S.notes, evals: S.evals,
     slips: S.slips, takebacks: S.takebacks, hints: S.hints, nudges: S.nudges,
-    from: S.from, over: S.over, started: S.started}});
+    from: S.from, start: S.start, spar: S.spar, book: S.book, over: S.over, started: S.started}});
 }
 
 /** Rebuild a saved game by replaying it; anything that doesn't replay is dropped. */
 function restore(g){
   if(!g || !Array.isArray(g.moves) || (g.mine !== "w" && g.mine !== "b")) return false;
-  const game = new Chess();
+  const start = typeof g.start === "string" ? g.start : null;
+  let game;
+  try { game = new Chess(start || undefined); } catch(e){ return false; }
   for(const u of g.moves){
     if(typeof u !== "string" ||
        !game.move({from: u.slice(0,2), to: u.slice(2,4), promotion: u[4] || undefined})) return false;
@@ -2939,6 +3045,8 @@ function restore(g){
   S.takebacks = +g.takebacks || 0; S.hints = +g.hints || 0; S.nudges = +g.nudges || 0;
   S.ask = null; S.tip = null;
   S.from = g.from && typeof g.from === "object" ? g.from : null;
+  S.start = start; S.book = +g.book || 0;
+  S.spar = g.spar && typeof g.spar === "object" && g.spar.key ? g.spar : null;
   S.over = typeof g.over === "string" ? g.over : null;
   S.started = !!g.started || n > 0;
   S.id = g.id || newId(); S.startedAt = g.startedAt || new Date().toISOString();
@@ -2967,6 +3075,9 @@ function logGame(outcome, why){
   entry.evals = entry.moves.map((_, i) => Number.isFinite(S.evals[i]) ? Math.round(S.evals[i]) : null);
   entry.acc = window.Review ? Review.accuracy(S.notes.map(n => n && {best: n.top, played: n.got})) : null;
   if(S.from) entry.from = S.from;      // a replay, not a fresh game: calibration should skip it
+  if(S.start) entry.fen = S.start;     // began from a position, not move one
+  if(S.spar) entry.spar = S.spar;
+  if(S.book) entry.book = S.book;
   let all = readJSON(GAMES, []);
   if(!Array.isArray(all)) all = [];
   all = all.filter(g => g && g.id !== S.id);
@@ -2982,7 +3093,8 @@ const games = () => { const all = readJSON(GAMES, []); return Array.isArray(all)
    and play on from there against the same bot. It is a new game with its own
    id; `from` marks it as a replay so it is never mistaken for a fresh result. */
 function replayFrom(rec, ply){
-  const game = new Chess();
+  let game;
+  try { game = new Chess(rec.fen || undefined); } catch(e){ return false; }
   for(const san of rec.moves.slice(0, ply)) if(!game.move(san)) return false;
   if(game.isGameOver() || game.turn() !== rec.mine) return false;
   S.gen++; Engine.stop();
@@ -2992,7 +3104,8 @@ function replayFrom(rec, ply){
   document.querySelectorAll("#gsides [data-side]").forEach(b =>
     b.classList.toggle("primary", b.dataset.side === sidePref));
   restore({moves: game.history().map(uciOf), mine: rec.mine, flip: rec.mine === "b",
-           id: newId(), startedAt: new Date().toISOString(), started: true, from: {id: rec.id, ply}});
+           id: newId(), startedAt: new Date().toISOString(), started: true, from: {id: rec.id, ply},
+           start: rec.fen || null});
   shown = -1; $("gpromo").classList.add("hidden");
   if(window.Coach) Coach.reset(S);
   persist(); draw(); showNote();
@@ -3107,17 +3220,12 @@ function drawStatus(){
 function drawMoves(){
   const h = S.game.history();
   const rows = [];
-  for(let i = 0; i < h.length; i += 2){
-    const n = i/2 + 1;
-    const w = h[i], b = h[i+1];
-    rows.push(
-      `<div class="mrow"><span class="mno">${n}.</span>` +
-      `<button class="mply ${S.view===i+1?"on":""}" data-ply="${i+1}">${w.san}` +
-        noteDot(i) + `</button>` +
-      (b ? `<button class="mply ${S.view===i+2?"on":""}" data-ply="${i+2}">${b.san}` +
-        noteDot(i+1) + `</button>` : `<span class="mply"></span>`) +
-      `</div>`);
-  }
+  // a game begun from a position keeps its real move numbers, and may open on Black's move
+  const at = S.start && window.Review ? Review.startPly(S.start) : 0;
+  const cell = i => h[i] ? `<button class="mply ${S.view===i+1?"on":""}" data-ply="${i+1}">${h[i].san}` +
+    noteDot(i) + `</button>` : `<span class="mply">${i < 0 ? "…" : ""}</span>`;
+  for(let i = -(at % 2); i < h.length; i += 2)
+    rows.push(`<div class="mrow"><span class="mno">${(at + i)/2 + 1}.</span>${cell(i)}${cell(i+1)}</div>`);
   const box = $("gmoves");
   box.innerHTML = rows.join("") || '<p class="muted">No moves yet.</p>';
   box.querySelectorAll(".mply[data-ply]").forEach(b =>
@@ -3237,10 +3345,27 @@ async function afterHuman(rec){
   botTurn();
 }
 
+/* While the game is still inside your own opening tree, the bot answers the way
+   your real opponents did, as often as they did (js/spar.js). Past the tree, or
+   with Book off, the engine plays. The public build has no tree, so no book. */
+let bookRng = Math.random;
+function bookReply(){
+  if(!Feel.prefs.book || !window.Spar || typeof DATA === "undefined" || !DATA) return null;
+  const tree = DATA[S.mine === "w" ? "white" : "black"];
+  const m = tree && Spar.bookMove(tree.pos, S.game.posKey(), bookRng);
+  return m && S.game.moves().some(x => uciOf(x) === m.uci) ? m : null;
+}
+
 async function botTurn(){
   const gen = S.gen;
   S.thinking = true; S.stalled = false; drawStatus();
   let res = null;
+  const bk = bookReply();
+  if(bk){
+    await new Promise(r => setTimeout(r, 400));      // an instant reply reads as a glitch
+    if(S.gen !== gen) return;
+    res = {uci: bk.uci, slipped: false}; S.book++;
+  }
   // a dead worker is respawned by the next call, so one retry usually recovers
   for(let attempt = 0; attempt < 2 && !res; attempt++){
     try { res = await Engine.botMove(S.game.fen(), S.level); }
@@ -3276,8 +3401,21 @@ function checkOver(){
   return true;
 }
 
+/* A sparring game from a queued weak line ended: move the line along its boxes. */
+const SPAR = "chess-trainer-spar";
+const sparRead = () => { const q = readJSON(SPAR, []); return Array.isArray(q) ? q.filter(x => x && x.key && x.side) : []; };
+const sparWrite = q => writeJSON(SPAR, q);
+function gradeSpar(outcome){
+  if(!S.spar || !window.Spar) return;
+  const q = sparRead(), i = q.findIndex(x => x.key === S.spar.key && x.side === S.spar.side);
+  if(i < 0 || q[i].lastId === S.id) return;          // finished again after a takeback: one grade per game
+  q[i] = Object.assign(Spar.grade(q[i], outcome, Date.now()), {lastId: S.id});
+  sparWrite(q);
+}
+
 function finish(outcome, why){
   logGame(outcome, why);
+  gradeSpar(outcome);
   persist(); drawStatus();
   if(window.Coach) Coach.gameOver(S);
   drawMoves();
@@ -3365,7 +3503,32 @@ function showNote(){
 
 /* ------------------------------------------------------------ lifecycle */
 
-function newGame(){
+/* Play from here: a new game that begins from an opening line (kept in the move
+   list) or from a bare position. You play `mine`; if it is the other side's
+   move the bot — book first — starts. */
+function playFrom(o){
+  let game;
+  try { game = new Chess(o.line ? undefined : o.fen); } catch(e){ return false; }
+  for(const san of o.line || []) if(!game.move(san)) return false;
+  const mine = o.mine || game.turn();
+  if(game.isGameOver() || (mine !== "w" && mine !== "b")) return false;
+  S.gen++; Engine.stop();
+  sidePref = mine;
+  document.querySelectorAll("#gsides [data-side]").forEach(b =>
+    b.classList.toggle("primary", b.dataset.side === sidePref));
+  restore({moves: game.history().map(uciOf), mine, flip: mine === "b", id: newId(),
+           startedAt: new Date().toISOString(), started: true,
+           start: o.line ? null : o.fen, spar: o.spar || null});
+  shown = -1; S.premove = null; S.cur = null; $("gpromo").classList.add("hidden");
+  if(window.Coach) Coach.reset(S);
+  persist(); draw(); showNote();
+  if(S.game.turn() !== S.mine) botTurn();
+  else if(window.Coach) Coach.previewForUser(S);
+  return true;
+}
+
+function newGame(fen){
+  if(typeof fen === "string") return playFrom({fen});
   S.gen++; Engine.stop();              // drop any move still being thought about
   S.game = new Chess();
   S.view = 0; S.sel = null; S.over = null; S.notes = []; S.evals = [];
@@ -3373,6 +3536,7 @@ function newGame(){
   S.reviewing = false; S.stalled = false; S.slips = []; S.takebacks = 0;
   S.premove = null; S.cur = null; shown = -1;
   S.ask = null; S.tip = null; S.hints = 0; S.nudges = 0; S.from = null;
+  S.start = null; S.spar = null; S.book = 0;
   S.flip = S.mine === "b";
   S.id = newId(); S.startedAt = new Date().toISOString();
   $("gpromo").classList.add("hidden");
@@ -3422,7 +3586,7 @@ function init(){
   // the pointer (focus, picking a piece up), and a browser fires no click when
   // the element that took the pointerdown is gone. onclick is left for clicks
   // that come without a pointer — assistive tech, scripts.
-  let tapped = 0;
+  let tapped = -1e9;      // not 0: a scripted click in the page's first 700 ms would look like a tap's echo
   board.onclick = e => {
     if(performance.now() - tapped < 700) return;
     const cell = e.target.closest(".sq");
@@ -3525,6 +3689,12 @@ function init(){
     $("gnudge").textContent = on ? "Warnings on" : "Warnings off"; $("gnudge").setAttribute("aria-pressed", on); };
   $("gnudge").onclick = () => { Feel.setPref("nudge", !Feel.prefs.nudge); S.ask = null; nudgeBtn(); showNote(); };
   nudgeBtn();
+  const hasBook = typeof DATA !== "undefined" && !!DATA && !!DATA.white && Object.keys(DATA.white.pos || {}).length > 1;
+  const bookBtn = () => { const on = Feel.prefs.book;
+    $("gbook").textContent = on ? "Book on" : "Book off"; $("gbook").setAttribute("aria-pressed", on); };
+  $("gbook").classList.toggle("hidden", !hasBook);
+  $("gbook").onclick = () => { Feel.setPref("book", !Feel.prefs.book); bookBtn(); };
+  bookBtn();
   $("gflip").onclick = () => { S.flip = !S.flip; persist(); draw(); };
   $("gback").onclick = () => { if(S.view > 0){ S.view--; S.sel=null; draw(); showNote(); } };
   $("gfwd").onclick  = () => { if(S.view < S.game.history().length){ S.view++; S.sel=null; draw(); showNote(); } };
@@ -3579,7 +3749,8 @@ function init(){
 let booted = false;
 return {
   show(){ if(!booted){ booted = true; init(); } Engine.boot(); },
-  state: S, draw, showNote, hint, retry, games, replayFrom,
+  state: S, draw, showNote, hint, retry, games, replayFrom, newGame, playFrom, sparRead, sparWrite,
+  setBookRng: f => { bookRng = f || Math.random; },
 };
 })();
 
@@ -3808,7 +3979,7 @@ window.Log = Log;
 </script>
 
 <script>
-const BUILD = "2026-09-17+7a87415";
+const BUILD = "2026-09-17+8faa8ba";
 const DATA = {"me":"","white":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"black":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"habits":null,"puzzles":[],"patterns":null};
 
 /* ============================ board rendering ============================ */
@@ -4059,6 +4230,20 @@ function exploreTo(nd){
   show("explore"); drawExplore();
 }
 
+/* ============================ play from here ============================ */
+/* Hand a position to the Play tab. A game in progress is asked about first: the
+   button turns into the question and the second press goes. */
+let hereArmed = null;
+function playHere(btn, id, opts){
+  Play.show();                                         // boots the Play tab if it has not been opened yet
+  const busy = Play.state.started && !Play.state.over;
+  if(busy && hereArmed !== id){ hereArmed = id; btn.textContent = "Replace the game in progress?"; return; }
+  hereArmed = null;
+  if(Play.playFrom(opts)) show("play");
+  else btn.textContent = "That position could not be set up";
+}
+const ME = () => side === "black" ? "b" : "w";
+
 /* ============================ explore ============================ */
 let stack = [];   // [{key, san}]
 
@@ -4068,6 +4253,8 @@ function drawExplore(){
   const key = eKey(), nd = node(key);
   renderBoard($("eboard"), key, {flip: side === "black"});
   $("epath").innerHTML = lineText(stack.map(s => s.san), true);
+  $("eplay").textContent = "Play from here"; hereArmed = null;
+  $("eplay").onclick = () => playHere($("eplay"), "e:" + key, {line: stack.map(s => s.san), mine: ME()});
   $("eturn").innerHTML = `<b>${turnOf(key) === "w" ? "White" : "Black"}</b> to move`;
   const s = raw(nd);
   $("estat").innerHTML = `
@@ -4094,16 +4281,9 @@ function drawExplore(){
 /* ============================ weak spots ============================ */
 function drawWeak(){
   $("wside").textContent = side === "black" ? "Black" : "White";
-  const me = side === "black" ? "b" : "w";
-  const P = POS(), par = raw(node(START()));
-  const rows = [];
-  for(const key in P){
-    if(turnOf(key) === me) continue;      // positions you *land in* after your move
-    const nd = P[key];
-    if(nd.n < 25 || !nd.line.length) continue;
-    rows.push({key, nd, s: raw(nd)});
-  }
-  rows.sort((a,b) => a.s - b.s);
+  const par = raw(node(START()));
+  const rows = Spar.weakLines(POS(), ME(), raw);   // positions you *land in* after your move
+  drawQueue(rows);
   const body = $("wbody"); body.innerHTML = "";
   for(const r of rows.slice(0,25)){
     const d = r.s - par;
@@ -4112,11 +4292,40 @@ function drawWeak(){
       <td class="line">${lineText(r.nd.line, true)}</td>
       <td class="num">${r.nd.n}</td>
       <td class="num" style="color:${scoreColor(r.s)};font-weight:650">${pctOf(r.s)}%</td>
-      <td class="num" style="color:${d<0?"var(--no-ink)":"var(--ok-ink)"}">${d>=0?"+":""}${(100*d).toFixed(1)}</td>`;
+      <td class="num" style="color:${d<0?"var(--no-ink)":"var(--ok-ink)"}">${d>=0?"+":""}${(100*d).toFixed(1)}</td>
+      <td class="num"><button class="btn" data-wplay>Play from here</button></td>`;
     tr.onclick = () => exploreTo(r.nd);
+    tr.querySelector("[data-wplay]").onclick = e => { e.stopPropagation();
+      playHere(e.currentTarget, "w:" + r.key, {line: r.nd.line, mine: ME(), spar: inQueue(r.key)}); };
     body.appendChild(tr);
   }
-  if(!rows.length) body.innerHTML = '<tr><td colspan="4" class="muted">Not enough games.</td></tr>';
+  if(!rows.length) body.innerHTML = '<tr><td colspan="5" class="muted">Not enough games.</td></tr>';
+}
+
+/* The sparring queue: your worst lines come back on a schedule — a win sends a
+   line further away, a loss brings it back tomorrow (js/spar.js). */
+const inQueue = key => Play.sparRead().some(q => q.side === side && q.key === key) ? {key, side} : null;
+function drawQueue(rows){
+  const now = Date.now();
+  const queue = Spar.sync(Play.sparRead(), rows, side, now);
+  Play.sparWrite(queue);
+  const mine = queue.filter(q => q.side === side && node(q.key)), due = Spar.due(mine, side, now);
+  $("wqnote").textContent = !mine.length ? "No lines to spar yet." :
+    due.length ? `${hCount(due.length, "line")} due today, as ${side === "black" ? "Black" : "White"}. The bot answers the way your opponents did.`
+               : `Nothing due today. Next: ${Spar.when(mine.slice().sort((a, b) => a.due - b.due)[0], now)}.`;
+  const box = $("wqueue"); box.innerHTML = "";
+  for(const q of due.concat(mine.filter(x => !due.includes(x)).sort((a, b) => a.due - b.due))){
+    const nd = node(q.key), isDue = q.due <= now;
+    const row = document.createElement("div");
+    row.className = "qrow";
+    row.innerHTML = `<div class="line">${lineText(nd.line, true)}</div>
+      <div class="muted">${isDue ? "<b>Due</b>" : "Back " + Spar.when(q, now)} · ${pctOf(raw(nd))}% over ${nd.n} games` +
+        (q.seen ? ` · sparred ${hCount(q.seen, "time")}, last ${H_OUT[q.last] ? H_OUT[q.last].toLowerCase() : "played"}` : "") + `</div>
+      <button class="btn ${isDue ? "primary" : ""}">Spar this line</button>`;
+    row.querySelector("button").onclick = e =>
+      playHere(e.currentTarget, "q:" + q.key, {line: nd.line, mine: ME(), spar: {key: q.key, side}});
+    box.appendChild(row);
+  }
 }
 
 /* ============================ blunders ============================ */
@@ -4234,6 +4443,9 @@ function pDraw(){
     : pStep === 1 ? `You played <b>${esc(ex.played)}</b>` : `<b>${esc(ex.punish)}</b> followed`;
   $("pshow").textContent = pStep === 0 ? "Show me" : pStep === 1 ? "And then" : "From the start";
   $("pextitle").textContent = `Position ${pIdx + 1} of ${r.examples.length}`;
+  $("pplay").textContent = "Play from here"; hereArmed = null;
+  $("pplay").onclick = () => playHere($("pplay"), "p:" + ex.fen,
+    {fen: `${ex.fen} 0 ${Math.floor(ex.ply / 2) + 1}`, mine: ex.me});
   $("pmeta").innerHTML =
     `From your game on <b>${ex.date}</b>, move ${Math.floor(ex.ply/2)+1}.` +
     (pStep >= 1 ? ` You played <b>${esc(ex.played)}</b>.` : "") +
@@ -4486,7 +4698,9 @@ const hCount = (n, one, many) => `${n} ${n === 1 ? one : many || one + "s"}`;
 /** Replay the logged SAN once per game: positions and from/to squares per ply. */
 function hReplay(rec){
   if(hLine && hLine.id === rec.id) return hLine;
-  const g = new Chess(), fens = [g.fen()], mv = [];
+  let g;
+  try { g = new Chess(rec.fen || undefined); } catch(e){ g = new Chess(); }
+  const fens = [g.fen()], mv = [];
   for(const san of rec.moves){
     const m = g.move(san);
     if(!m) break;
@@ -4553,7 +4767,7 @@ function hSummary(){
 
   const km = Review.keyMoments(rec, 3);
   $("hmoments").innerHTML = km.map(k => `<div class="hmoment">
-      <b>Move ${Math.floor(k.ply / 2) + 1}, ${esc(k.san)}</b> — ${H_TAG[k.tag]}.` +
+      <b>Move ${Math.floor((Review.startPly(rec.fen) + k.ply) / 2) + 1}, ${esc(k.san)}</b> — ${H_TAG[k.tag]}.` +
       (k.best && k.best !== k.san ? ` <b>${esc(k.best)}</b> was the move.` : "") +
       `<div class="row"><button class="btn" data-hply="${k.ply}">Show the position</button>
        <button class="btn" data-hretry="${k.ply}">${hArmed === k.ply ? "Replace the game in progress?" : "Try again from here"}</button></div></div>`).join("") ||
@@ -4578,18 +4792,19 @@ function hDraw(){
   renderBoard($("hboard"), L.fens[hPly], {flip: hFlip, highlight: hl});
   const tag = last && rec.tags && rec.tags[hPly - 1], best = last && rec.bests && rec.bests[hPly - 1];
   const ev = last && rec.evals && rec.evals[hPly - 1];
-  $("hturn").innerHTML = !last ? "<b>Start of the game</b>" :
-    `<b>${Math.floor((hPly - 1) / 2) + 1}${hPly % 2 ? "." : "…"} ${esc(last.san)}</b>` +
+  const at = Review.startPly(rec.fen);      // a game begun from a position keeps its real move numbers
+  $("hturn").innerHTML = !last ? (rec.fen ? "<b>The position it began from</b>" : "<b>Start of the game</b>") :
+    `<b>${Math.floor((at + hPly - 1) / 2) + 1}${(at + hPly) % 2 ? "." : "…"} ${esc(last.san)}</b>` +
     (tag ? ` — ${H_TAG[tag]}${best && best !== last.san ? `, ${esc(best)} was the move` : ""}` : "") +
     ((rec.slips || []).includes(hPly - 1) ? " — a deliberate bot slip" : "") +
     (ev != null ? ` <span class="muted">(${Review.evalWords(ev)})</span>` : "");
   $("hback").disabled = hPly === 0; $("hfwd").disabled = hPly === n;
 
   const rows = [];
-  for(let i = 0; i < n; i += 2){
+  for(let i = -(at % 2); i < n; i += 2){
     const cell = j => L.mv[j] ? `<button class="mply ${hPly === j + 1 ? "on" : ""}" data-hply="${j + 1}">${esc(L.mv[j].san)}` +
-      (rec.tags && rec.tags[j] ? `<i class="dot ${rec.tags[j]}"></i>` : "") + `</button>` : `<span class="mply"></span>`;
-    rows.push(`<div class="mrow"><span class="mno">${i / 2 + 1}.</span>${cell(i)}${cell(i + 1)}</div>`);
+      (rec.tags && rec.tags[j] ? `<i class="dot ${rec.tags[j]}"></i>` : "") + `</button>` : `<span class="mply">${j < 0 ? "…" : ""}</span>`;
+    rows.push(`<div class="mrow"><span class="mno">${(at + i) / 2 + 1}.</span>${cell(i)}${cell(i + 1)}</div>`);
   }
   $("hmoves").innerHTML = rows.join("");
   $("hmoves").querySelectorAll("[data-hply]").forEach(b => b.onclick = () => { hPly = +b.dataset.hply; hDraw(); });
