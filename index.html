@@ -1681,6 +1681,242 @@ return Game;
 
 if(typeof module !== "undefined" && module.exports) module.exports = Chess;
 </script>
+<script>/* Tactics kernel — who attacks what, what an exchange is worth, what is loose.
+ *
+ * see(), worstReply() and isSafe() are build.py's functions of the same names,
+ * move for move: same piece values (the king counts 0, so it recaptures first
+ * when it legally can), same lowest-square tie-break, same legality test for
+ * every recapture. gate_tactics.js holds them to build.py's own answer on every
+ * blunder position in the archive; change one side and the gate says so.
+ *
+ * Everything here reads the position and nothing else — no engine, no DATA.
+ */
+const Tactics = (function(){
+"use strict";
+
+const PAWN=1, KNIGHT=2, BISHOP=3, ROOK=4, QUEEN=5, KING=6;
+const WHITE=8, BLACK=16, COLOR=24, TYPE=7;
+const VAL  = [0, 1, 3, 3, 5, 9, 0];
+const NAME = ["", "pawn", "knight", "bishop", "rook", "queen", "king"];
+const BLUNDER_COST = 2;               // build.py's dial of the same name
+
+const KNIGHT_D = [-33,-31,-18,-14,14,18,31,33];
+const BISHOP_D = [-17,-15,15,17];
+const ROOK_D   = [-16,-1,1,16];
+const KING_D   = [-17,-16,-15,-1,1,15,16,17];
+
+const FILES = "abcdefgh";
+const sqName = s => FILES[s & 15] + ((s >> 4) + 1);
+const nameSq = n => FILES.indexOf(n[0]) + ((+n[1] - 1) << 4);
+const onBoard = s => (s & 0x88) === 0;
+const side  = c => c === "w" || c === WHITE ? WHITE : BLACK;
+const other = c => c === WHITE ? BLACK : WHITE;
+const isCapture = m => m.flags.includes("c") || m.flags.includes("e");
+
+/** Squares (0x88, ascending) of `color`'s pieces that attack `sq`. Pinned pieces
+ *  count — whether one may really capture is a question for legal(). */
+function attackersOf(B, sq, color){
+  const out = [];
+  for(let s = 0; s < 128; s++){
+    if(s & 0x88){ s += 7; continue; }
+    const pc = B.b[s];
+    if(!pc || (pc & COLOR) !== color || s === sq) continue;
+    const t = pc & TYPE, d = sq - s;
+    if(t === PAWN){
+      const dir = color === WHITE ? 16 : -16;
+      if(d === dir - 1 || d === dir + 1) out.push(s);
+    } else if(t === KNIGHT){ if(KNIGHT_D.includes(d)) out.push(s); }
+    else if(t === KING){ if(KING_D.includes(d)) out.push(s); }
+    else {
+      for(const dd of (t === BISHOP ? BISHOP_D : t === ROOK ? ROOK_D : KING_D)){
+        let x = s + dd;
+        while(onBoard(x) && x !== sq && !B.b[x]) x += dd;
+        if(x === sq){ out.push(s); break; }
+      }
+    }
+  }
+  return out;
+}
+
+/** Static exchange evaluation: net pawns the mover wins on the destination
+ *  square, each side recapturing with its least valuable legal piece. */
+function seeRaw(B, m){
+  const mover = B.b[m.from];
+  if(!mover) return 0;
+  const captured = B.b[m.to];                     // en passant lands on an empty square: 0, as build.py has it
+  const gain = [captured ? VAL[captured & TYPE] : 0];
+  let onSquare = VAL[mover & TYPE];
+  const made = [m];
+  B.makeMove(m);
+  for(;;){
+    let best = 99, atk = null;
+    for(const s of attackersOf(B, m.to, B.turn)){
+      const v = VAL[B.b[s] & TYPE];
+      if(v >= best) continue;
+      const cand = B.legal(s).find(x => x.to === m.to && (!x.promo || x.promo === QUEEN));
+      if(cand){ best = v; atk = cand; }
+    }
+    if(!atk) break;
+    gain.push(onSquare - gain[gain.length - 1]);
+    onSquare = best;
+    B.makeMove(atk); made.push(atk);
+  }
+  while(made.length) B.unmakeMove(made.pop());
+  while(gain.length > 1){
+    const last = gain.pop();
+    gain[gain.length - 1] = -Math.max(-gain[gain.length - 1], last);
+  }
+  return gain[0];
+}
+
+function worstRaw(B){
+  let best = 0;
+  for(const m of B.legal()) if(isCapture(m)) best = Math.max(best, seeRaw(B, m));
+  return best;
+}
+
+function safeRaw(B, m){
+  if(isCapture(m) && seeRaw(B, m) < 0) return false;
+  B.makeMove(m);
+  const mate = B.inCheck() && B.legal().length === 0;
+  const ok = mate || worstRaw(B) < BLUNDER_COST;
+  B.unmakeMove(m);
+  return ok;
+}
+
+const raw = mv => mv._m || mv;
+const uci = m => m.from + m.to + (m.promotion || "");
+
+const see        = (game, mv) => seeRaw(game.board, raw(mv));
+const worstReply = game => worstRaw(game.board);
+const isSafe     = (game, mv) => safeRaw(game.board, raw(mv));
+
+/** Every move that hands nothing over next move, as build.py lists them:
+ *  [san, uci] pairs, sorted. */
+function safeMoves(game){
+  const cmp = (a, b) => a < b ? -1 : a > b ? 1 : 0;
+  return game.moves().filter(m => safeRaw(game.board, m._m))
+    .map(m => [m.san, uci(m)])
+    .sort((a, b) => cmp(a[0], b[0]) || cmp(a[1], b[1]));
+}
+
+/** Pieces of `color` attacking `sq`: [{sq, piece}], cheapest first. With `deep`,
+ *  pieces lined up behind their own attackers count too (doubled rooks, a bishop
+ *  behind the pawn) — they join the exchange as soon as the one in front has taken. */
+function attackers(game, sq, color, deep){
+  const B = game.board, target = typeof sq === "string" ? nameSq(sq) : sq;
+  let found = attackersOf(B, target, side(color));
+  if(deep){
+    const lifted = {b: Int8Array.from(B.b)};
+    for(let wave = found; wave.length; found = found.concat(wave)){
+      for(const s of wave) lifted.b[s] = 0;
+      wave = attackersOf(lifted, target, side(color));
+    }
+  }
+  return found
+    .map(s => ({sq: sqName(s), piece: NAME[B.b[s] & TYPE], val: VAL[B.b[s] & TYPE]}))
+    .sort((a, b) => (a.piece === "king") - (b.piece === "king") || a.val - b.val)
+    .map(({sq, piece}) => ({sq, piece}));
+}
+
+/** The same position with `color` to move — "what could they take if I passed?".
+ *  null when that position cannot exist (the other side would be in check). */
+function asTurn(game, color){
+  const c = side(color);
+  if(game.board.turn === c) return game;
+  if(game.board.inCheck()) return null;
+  const p = game.fen().split(" ");
+  p[1] = c === WHITE ? "w" : "b"; p[3] = "-";
+  return new game.constructor(p.join(" "));
+}
+
+/** Pieces of `color` that can be taken for profit right now, worst first:
+ *  [{sq, piece, loss, by}] — `by` is the capture that wins the most. */
+function hanging(game, color){
+  const c = side(color), g = asTurn(game, other(c));
+  if(!g) return [];
+  const B = g.board, worst = {};
+  for(const m of B.legal()){
+    if(!isCapture(m) || !B.b[m.to]) continue;
+    const loss = seeRaw(B, m);
+    if(loss > 0 && (!worst[m.to] || loss > worst[m.to].loss))
+      worst[m.to] = {sq: sqName(m.to), piece: NAME[B.b[m.to] & TYPE], loss, by: sqName(m.from)};
+  }
+  return Object.values(worst).sort((a, b) => b.loss - a.loss || (a.sq < b.sq ? -1 : 1));
+}
+
+/** Pieces of `color` pinned to their own king: [{sq, piece, by}]. */
+function pinned(game, color){
+  const B = game.board, c = side(color), k = B.kingSq(c), out = [];
+  if(k < 0) return out;
+  for(const dd of KING_D){
+    let x = k + dd, mine = -1;
+    for(; onBoard(x); x += dd){
+      const pc = B.b[x];
+      if(!pc) continue;
+      if((pc & COLOR) === c){ if(mine >= 0) break; mine = x; continue; }
+      const t = pc & TYPE, diag = BISHOP_D.includes(dd);
+      if(mine >= 0 && (t === QUEEN || t === (diag ? BISHOP : ROOK)))
+        out.push({sq: sqName(mine), piece: NAME[B.b[mine] & TYPE], by: sqName(x)});
+      break;
+    }
+  }
+  return out;
+}
+
+/** Pieces of `color` hitting two or more real targets at once — the king, a
+ *  bigger piece, or one nothing defends — and not simply takeable themselves. */
+function forks(game, color){
+  const B = game.board, c = side(color), them = other(c), out = [];
+  const loose = new Set(hanging(game, c).map(h => h.sq));
+  for(let s = 0; s < 128; s++){
+    if(s & 0x88){ s += 7; continue; }
+    const pc = B.b[s];
+    if(!pc || (pc & COLOR) !== c || loose.has(sqName(s))) continue;
+    const targets = [];
+    for(let t = 0; t < 128; t++){
+      if(t & 0x88){ t += 7; continue; }
+      const tp = B.b[t];
+      if(!tp || (tp & COLOR) !== them || !attackersOf(B, t, c).includes(s)) continue;
+      if((tp & TYPE) === KING || VAL[tp & TYPE] > VAL[pc & TYPE] || !attackersOf(B, t, them).length)
+        targets.push(sqName(t));
+    }
+    if(targets.length >= 2) out.push({sq: sqName(s), piece: NAME[pc & TYPE], targets});
+  }
+  return out;
+}
+
+const times = n => n === 1 ? "once" : n === 2 ? "twice" : n + " times";
+const worth = n => n === 1 ? "about a pawn" : `about ${n} pawns of material`;
+const list  = a => a.map(x => `${x.piece} ${x.sq}`).join(", ");
+
+/** One plain sentence on why the piece on `sq` is or is not in trouble:
+ *  attackers against defenders, then what the exchange comes to. */
+function why(game, sq){
+  const B = game.board, s = typeof sq === "string" ? nameSq(sq) : sq, pc = B.b[s];
+  if(!pc) return "";
+  const c = pc & COLOR, t = pc & TYPE;
+  const what = `The ${NAME[t]} on ${sqName(s)}`;
+  const att = attackers(game, s, other(c), true), def = attackers(game, s, c, true);
+  if(!att.length) return `${what} is not attacked.`;
+  if(t === KING) return `${what} is in check from the ${att[0].piece} on ${att[0].sq}.`;
+  if(!def.length) return `${what} is attacked by the ${att[0].piece} on ${att[0].sq}` +
+    (att.length > 1 ? ` and ${att.length - 1} more` : "") + ` and nothing defends it.`;
+  const count = `${what} is attacked ${times(att.length)} (${list(att)}) and defended ${times(def.length)} (${list(def)})`;
+  const h = hanging(game, c).find(x => x.sq === sqName(s));
+  if(!h) return `${count} — it holds.`;
+  const cheap = att.find(a => a.piece !== "king");
+  if(cheap && VAL[NAME.indexOf(cheap.piece)] < VAL[t])
+    return `${count}, but a ${cheap.piece} takes a ${NAME[t]} gladly — defenders do not help. It costs ${worth(h.loss)}.`;
+  return `${count} — not enough: the exchange costs ${worth(h.loss)}.`;
+}
+
+return {VAL, BLUNDER_COST, see, worstReply, isSafe, safeMoves,
+        attackers, hanging, pinned, forks, why, asTurn};
+})();
+if(typeof window !== "undefined") window.Tactics = Tactics;
+if(typeof module !== "undefined" && module.exports) module.exports = Tactics;
+</script>
 <script>/* Stockfish wrapper: UCI in, promises out, plus rating-calibrated opponents.
  *
  * The engine is embedded in the page (see build.py) and run in a Blob worker,
@@ -3199,7 +3435,7 @@ window.Log = Log;
 </script>
 
 <script>
-const BUILD = "2026-09-17+d1e0056";
+const BUILD = "2026-09-17+3249359";
 const DATA = {"me":"","white":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"black":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"habits":null,"puzzles":[],"patterns":null};
 
 /* ============================ board rendering ============================ */
@@ -3546,7 +3782,6 @@ function applyMove(key, uci){
    real positions from your games to step through. build.py names the patterns
    (classify_blunder); js/patterns.js holds the words. */
 const PT = DATA.patterns;
-const HELD = Object.fromEntries(DATA.puzzles.map(p => [p.fen, p]));
 let pId = null, pIdx = 0, pStep = 0;
 Object.assign(store, {pPattern: store.pPattern || null});
 
@@ -3634,11 +3869,19 @@ function pDraw(){
     (from ? `<div style="margin-top:6px">It came out of ${fromName ? `your <b>${esc(fromName)}</b>: ` : ""}${lineText(from.line)}.
        <a href="#" id="pfrom" style="color:var(--accent)">Open that opening</a></div>` : "");
   if(from) $("pfrom").onclick = e => { e.preventDefault(); if(store.side !== exSide) setSide(exSide); exploreTo(from); };
-  const held = HELD[ex.fen];
-  $("palt").classList.toggle("hidden", !(pStep === 2 && held));
-  if(held) $("palt").innerHTML = `<b>Moves that kept everything:</b> ` +
-    held.safe.slice(0, 12).map(s => esc(s[0])).join(", ") +
-    (held.safe.length > 12 ? ` … and ${held.safe.length - 12} more` : "");
+  $("palt").classList.toggle("hidden", pStep !== 2);
+  if(pStep === 2){
+    // worked out here by js/tactics.js, so every study position has them, not just the newest 600
+    const g = new Chess(ex.fen + " 0 1");
+    const held = Tactics.safeMoves(g);
+    const u = ex.played_uci;
+    // attackers against defenders on the square that fell, as it stood once you had moved
+    const fell = g.move({from: u.slice(0,2), to: u.slice(2,4), promotion: u[4]}) ? Tactics.why(g, ex.punish_uci.slice(2,4)) : "";
+    $("palt").innerHTML = (fell ? `<div style="margin-bottom:6px">${esc(fell)}</div>` : "") +
+      `<b>Moves that kept everything:</b> ` +
+      held.slice(0, 12).map(s => esc(s[0])).join(", ") +
+      (held.length > 12 ? ` … and ${held.length - 12} more` : "");
+  }
 }
 
 function drawPuzzles(){
