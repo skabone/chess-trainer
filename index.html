@@ -248,6 +248,11 @@
   .note{font-size:12px;color:var(--faint);line-height:1.5;border-left:2px solid var(--line);
     padding-left:10px;margin-top:12px}
   .hidden{display:none !important}
+  .foot{margin-top:28px;font-size:12px;color:var(--faint)}
+  .toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:50;
+    display:flex;align-items:center;gap:12px;padding:10px 12px 10px 16px;
+    background:var(--panel2);border:1px solid var(--line);border-radius:var(--r);
+    box-shadow:0 8px 28px #0008;font-size:13.5px;max-width:calc(100vw - 32px)}
 </style>
 </head>
 <body>
@@ -575,6 +580,13 @@
   </div>
 </section>
 
+<footer class="foot" id="foot"></footer>
+
+</div>
+
+<div class="toast hidden" id="uptoast" role="status">
+  <span>Update ready</span>
+  <button class="btn tiny" id="upreload">Reload</button>
 </div>
 
 <script id="sf-loader" type="text/plain">/*!
@@ -782,6 +794,25 @@ const SETS = [
 
 let uid = 0;
 
+const TONES = w => ({light: w ? "#fbfaf7" : "#3d4149", dark: w ? "#cfc9bd" : "#181b20",
+                     ink: w ? "#23262b" : "#07080a"});
+
+/** The colours a finish actually puts on the square. piece() draws with these
+ *  and the legibility matrix in test.js measures them, so they cannot drift.
+ *  The two glyph finishes are coloured by CSS (.sq .p.w / .p.b / .etched). */
+function paint(fin, w){
+  const {light, dark, ink} = TONES(w);
+  switch(fin){
+    case "outline":   return {fill: w ? "#ffffff22" : "#00000033", stroke: w ? "#ffffff" : "#15181c"};
+    case "neon":      return {fill: null, stroke: w ? "#7ff3ff" : "#ff7ae0"};
+    case "flat":      return {fill: w ? "#f6f4ef" : "#23262c", stroke: null};
+    case "glyph":     return {fill: w ? "#ffffff" : "#23262b", stroke: w ? "#4a4a4a" : null};
+    case "glyphline": return {fill: null, stroke: w ? "#fbfaf7" : "#15181c"};
+    case "duotone": case "glass": return {fill: light, fill2: dark, stroke: ink};
+    default:          return {fill: light, stroke: ink};
+  }
+}
+
 /** One piece, as markup ready to drop inside a square. */
 function piece(type, colour){
   const set = SETS.find(s => s.id === state.set) || SETS[0];
@@ -793,15 +824,14 @@ function piece(type, colour){
     return `<span class="p ${colour} etched">${GLYPH[type]}</span>`;
 
   const shapes = Pieces[set.geom][type];
-  const light  = w ? "#fbfaf7" : "#3d4149";
-  const dark   = w ? "#cfc9bd" : "#181b20";
-  const ink    = w ? "#23262b" : "#07080a";
+  const {light, dark, ink} = TONES(w);
+  const tint = paint(set.fin, w);
   const id     = "g" + (++uid);
   let defs = "", attrs = "", extra = "";
 
   switch(set.fin){
     case "outline":
-      attrs = `fill="${w ? "#ffffff22" : "#00000033"}" stroke="${w ? "#ffffff" : "#15181c"}" stroke-width="2"`;
+      attrs = `fill="${tint.fill}" stroke="${tint.stroke}" stroke-width="2"`;
       break;
     case "duotone":
       defs = `<linearGradient id="${id}" x1="0" y1="0" x2="0" y2="1">
@@ -828,10 +858,10 @@ function piece(type, colour){
                 <feGaussianBlur stdDeviation="1.4" result="b"/>
                 <feMerge><feMergeNode in="b"/><feMergeNode in="SourceGraphic"/></feMerge>
               </filter>`;
-      attrs = `fill="none" stroke="${w ? "#7ff3ff" : "#ff7ae0"}" stroke-width="2.2" filter="url(#${id})"`;
+      attrs = `fill="none" stroke="${tint.stroke}" stroke-width="2.2" filter="url(#${id})"`;
       break;
     case "flat":
-      attrs = `fill="${w ? "#f6f4ef" : "#23262c"}" stroke="none" shape-rendering="crispEdges"`;
+      attrs = `fill="${tint.fill}" stroke="none" shape-rendering="crispEdges"`;
       break;
     default:
       attrs = `fill="${light}" stroke="${ink}" stroke-width="1.1"`;
@@ -898,9 +928,64 @@ function mountPicker(el){
   apply();
 }
 
-return {piece, apply, refresh, mountPicker, BOARDS, SETS, state};
+return {piece, paint, apply, refresh, mountPicker, BOARDS, SETS, state};
 })();
-window.Theme = Theme;
+if(typeof window !== "undefined") window.Theme = Theme;
+if(typeof module !== "undefined" && module.exports) module.exports = Theme;
+</script>
+<script>/* Drill scoring: how a move's record is turned into "your best move here".
+ * Pure — no DOM, no storage — so node js/test.js can hold it to account. */
+const Score = (function(){
+"use strict";
+
+/* A move needs this many games before it can be called your best here. */
+const MIN_OPTION = 6;    // shown as a real choice
+const MIN_BEST   = 10;   // eligible to be the answer
+const MIN_POS    = 8;    // position must have been reached this often
+const SHRINK     = 25;   // pseudo-games pulling small samples toward your average
+const TIE        = 0.03; // within 3 points of the best counts as right
+
+const raw = n => n.n ? (n.w + 0.5*n.d) / n.n : 0;
+
+/** Posterior mean: pulls a thin sample toward `prior` until it earns its number. */
+const adj = (m, prior) => (m.w + 0.5*m.d + SHRINK*prior) / (m.n + SHRINK);
+
+const options = node => node.mv.filter(m => m.n >= MIN_OPTION);
+
+/** Best move here: highest sample-adjusted score among moves with a real sample. */
+function bestOption(node){
+  const elig = options(node).filter(m => m.n >= MIN_BEST);
+  if(!elig.length) return null;
+  const prior = raw(node);
+  return elig.reduce((a,b) => adj(b,prior) > adj(a,prior) ? b : a);
+}
+
+/** Is this position a fair drill question? Returns its pool entry, or null. */
+function drillEntry(key, nd){
+  if(nd.n < MIN_POS) return null;
+  const o = options(nd);
+  if(o.length < 2) return null;
+  // a fair question needs at least two moves you've played enough to compare
+  if(o.filter(m => m.n >= MIN_BEST).length < 2) return null;
+  const best = bestOption(nd);
+  if(!best) return null;
+  const prior = raw(nd);
+  const most = o.reduce((a,b) => b.n > a.n ? b : a);   // your habit here
+  const gap  = adj(best, prior) - adj(most, prior);    // points left on the table
+  return {key, node: nd, best, gap, weight: Math.log(nd.n) * (0.01 + gap)};
+}
+
+/** Grade a drill answer: right means a real sample within TIE of the best. */
+function grade(node, best, picked){
+  const prior = raw(node);
+  const delta = adj(best, prior) - adj(picked, prior);
+  return {delta, right: picked.n >= MIN_BEST && delta <= TIE};
+}
+
+return {MIN_OPTION, MIN_BEST, MIN_POS, SHRINK, TIE, raw, adj, options, bestOption, drillEntry, grade};
+})();
+if(typeof window !== "undefined") window.Score = Score;
+if(typeof module !== "undefined" && module.exports) module.exports = Score;
 </script>
 <script>/* Chess rules — 0x88 board, full legality, SAN/FEN, draw detection.
  *
@@ -1486,6 +1571,19 @@ const LEVELS = [
   {elo: 2200, name: "Merciless", depth: 14, skill: 20, slip: 0, spread: 0},
 ];
 
+/** The slip decision on its own: given the engine's best move and its candidate
+ *  lines, does this level play something worse, and what? Pure, so a seeded
+ *  rng makes it testable. */
+function pickBotMove(L, bm, cand, rng){
+  if(L.slip === 0 || cand.length < 2 || rng() > L.slip) return {uci: bm, slipped: false};
+  // pick a worse-but-real candidate, within this level's tolerance
+  const top = scalar(cand[0]);
+  const worse = cand.filter(c => c.move !== bm && top - scalar(c) <= L.spread);
+  if(!worse.length) return {uci: bm, slipped: false};
+  const pick = worse[Math.floor(rng() * worse.length)];
+  return {uci: pick.move, slipped: true};
+}
+
 /**
  * A move from the bot at `level`, chosen from real candidate lines so its
  * mistakes look like mistakes rather than noise.
@@ -1507,20 +1605,13 @@ function botMove(fen, levelIdx, rng){
     if(bm === "(none)" || !bm) return {uci: null, slipped: false};
 
     const cand = Object.values(readScore(lines, 5)).filter(c => c.move);
-    if(L.slip === 0 || cand.length < 2 || rng() > L.slip) return {uci: bm, slipped: false};
-
-    // pick a worse-but-real candidate, within this level's tolerance
-    const top = scalar(cand[0]);
-    const worse = cand.filter(c => c.move !== bm && top - scalar(c) <= L.spread);
-    if(!worse.length) return {uci: bm, slipped: false};
-    const pick = worse[Math.floor(rng() * worse.length)];
-    return {uci: pick.move, slipped: true};
+    return pickBotMove(L, bm, cand, rng);
   });
 }
 
 function ready(){ return booting !== null && worker !== null; }
 
-return {boot, analyse, botMove, LEVELS, LIMITS, scalar, ready,
+return {boot, analyse, botMove, LEVELS, LIMITS, scalar, ready, readScore, pickBotMove,
         setInfoHandler(fn){ onInfo = fn; },
         onDeath(fn){ onDeath = fn; },
         /** Abandon the current search and everything queued behind it. */
@@ -1528,7 +1619,8 @@ return {boot, analyse, botMove, LEVELS, LIMITS, scalar, ready,
         /** Test hook: kill the worker silently, the way a crashed tab process does. */
         debugKill(){ if(worker) worker.terminate(); }};
 })();
-window.Engine = Engine;
+if(typeof window !== "undefined") window.Engine = Engine;
+if(typeof module !== "undefined" && module.exports) module.exports = Engine;
 </script>
 <script>/* The coach. Explains what a move did and what to aim for instead.
  *
@@ -1691,6 +1783,19 @@ function hangDetail(afterFen, me, bestReplyUci){
   return {san: m.san, lost, victim};
 }
 
+/** The verdict line for a reviewed move. Pure wording — no engine, no DOM. */
+function verdict(cls, played, bestSan, hang, loss){
+  if(cls.tag){
+    return `<div class="verdict ${cls.tag === "inacc" ? "meh" : "no"}">
+      <b>${cls.label}: ${played}</b>` +
+      (hang ? ` — ${hang.san} wins ${hang.lost} points of material.`
+            : ` — it costs about ${(loss/100).toFixed(1)} pawns of position.`) + `</div>`;
+  }
+  if(bestSan && played === bestSan)
+    return `<div class="verdict ok"><b>${played}</b> — the best move here.</div>`;
+  return `<div class="verdict ok"><b>${played}</b> holds up fine.</div>`;
+}
+
 let S = null, lastPreview = null;
 
 function reset(state){
@@ -1772,18 +1877,7 @@ async function review(state, rec){
     return;
   }
 
-  let html = "";
-  if(cls.tag){
-    html += `<div class="verdict ${cls.tag === "blunder" ? "no" : cls.tag === "mistake" ? "no" : "meh"}">
-      <b>${cls.label}: ${played}</b>`;
-    if(hang) html += ` — ${hang.san} wins ${hang.lost} points of material.`;
-    else html += ` — it costs about ${(loss/100).toFixed(1)} pawns of position.`;
-    html += `</div>`;
-  } else if(bestSan && played === bestSan){
-    html += `<div class="verdict ok"><b>${played}</b> — the best move here.</div>`;
-  } else {
-    html += `<div class="verdict ok"><b>${played}</b> holds up fine.</div>`;
-  }
+  let html = verdict(cls, played, bestSan, hang, loss);
 
   if(cls.tag && bestSan && bestSan !== played){
     const pvSan = describePv(rec.before, cands[0].pv);
@@ -1854,12 +1948,14 @@ function gameOver(state){
   S.notes.forEach(n => { if(n) n.hidden = false; });
 }
 
-return {reset, review, previewForUser, gameOver, principles, principleTip, fmtEval};
+return {reset, review, previewForUser, gameOver, principles, principleTip, fmtEval,
+        CLASS, classify, verdict, fromPov, hangDetail};
 })();
 
 /* `const` at top level does not become a window property, and play.js guards on
    `window.Coach` — without this the coach silently never runs. */
-window.Coach = Coach;
+if(typeof window !== "undefined") window.Coach = Coach;
+if(typeof module !== "undefined" && module.exports) module.exports = Coach;
 </script>
 <script>/* Play tab: a real game against a calibrated bot, with takebacks and
  * move-by-move navigation. Coaching lives in coach.js and hooks in here. */
@@ -2530,7 +2626,7 @@ window.Log = Log;
 </script>
 
 <script>
-const BUILD = "2026-09-17+ee284d0";
+const BUILD = "2026-09-17+9312406";
 const DATA = {"me":"","white":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"black":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"habits":null,"puzzles":[]};
 
 /* ============================ board rendering ============================ */
@@ -2575,18 +2671,9 @@ function renderBoard(el, key, opts={}){
 }
 
 /* ============================ scoring ============================ */
-/* A move needs this many games before it can be called your best here. */
-const MIN_OPTION = 6;    // shown as a real choice
-const MIN_BEST   = 10;   // eligible to be the answer
-const MIN_POS    = 8;    // position must have been reached this often
-const SHRINK     = 25;   // pseudo-games pulling small samples toward your average
-const TIE        = 0.03; // within 3 points of the best counts as right
-
-const raw = n => n.n ? (n.w + 0.5*n.d) / n.n : 0;
+/* Thresholds and the maths live in js/score.js, where node js/test.js can reach them. */
+const {MIN_OPTION, MIN_BEST, MIN_POS, SHRINK, TIE, raw, adj, options, bestOption} = Score;
 const pctOf = s => (100*s).toFixed(1);
-
-/** Posterior mean: pulls a thin sample toward `prior` until it earns its number. */
-const adj = (m, prior) => (m.w + 0.5*m.d + SHRINK*prior) / (m.n + SHRINK);
 
 function scoreColor(s){
   if(s >= .55) return "var(--good)";
@@ -2600,16 +2687,6 @@ function scoreBg(s){
 }
 
 const turnOf = key => key.split(" ")[1];
-const options = node => node.mv.filter(m => m.n >= MIN_OPTION);
-
-/** Best move here: highest sample-adjusted score among moves with a real sample. */
-function bestOption(node){
-  const elig = options(node).filter(m => m.n >= MIN_BEST);
-  if(!elig.length) return null;
-  const prior = raw(node);
-  return elig.reduce((a,b) => adj(b,prior) > adj(a,prior) ? b : a);
-}
-
 /* ============================ state ============================ */
 const LS = "chess-trainer-v1";
 /* A corrupt value here used to throw at boot and take every tab down with it. */
@@ -2638,18 +2715,8 @@ function buildPool(){
   pool = [];
   for(const key in P){
     if(turnOf(key) !== me) continue;
-    const nd = P[key];
-    if(nd.n < MIN_POS) continue;
-    const o = options(nd);
-    if(o.length < 2) continue;
-    // a fair question needs at least two moves you've played enough to compare
-    if(o.filter(m => m.n >= MIN_BEST).length < 2) continue;
-    const best = bestOption(nd);
-    if(!best) continue;
-    const prior = raw(nd);
-    const most = o.reduce((a,b) => b.n > a.n ? b : a);   // your habit here
-    const gap  = adj(best, prior) - adj(most, prior);    // points left on the table
-    pool.push({key, node: nd, best, gap, weight: Math.log(nd.n) * (0.01 + gap)});
+    const entry = Score.drillEntry(key, P[key]);
+    if(entry) pool.push(entry);
   }
   pool.sort((a,b) => b.weight - a.weight);
 }
@@ -2721,8 +2788,7 @@ function answer(picked){
   const nd = current.node, best = current.best, prior = raw(nd);
   store.seen[current.key] = (store.seen[current.key]||0) + 1;
   store.tries++;
-  const delta = adj(best, prior) - adj(picked, prior);
-  const right = picked.n >= MIN_BEST && delta <= TIE;
+  const {delta, right} = Score.grade(nd, best, picked);
   if(right) store.hits++;
   save();
 
@@ -3298,9 +3364,34 @@ if(PERSONAL){
 
   // only where one is actually being served — it 404s off the filesystem
   if("serviceWorker" in navigator &&
-     (location.protocol === "https:" || location.hostname === "localhost"))
-    navigator.serviceWorker.register("sw.js").catch(function(){});
+     (location.protocol === "https:" || location.hostname === "localhost")){
+    const sw = navigator.serviceWorker;
+    // a new build installs beside the old one and waits; offer it, never force
+    // it — the game autosaves every ply, so Reload lands back on the same move
+    const offer = function(w){
+      if(!w || !sw.controller) return;      // first install: nothing to update
+      $("uptoast").classList.remove("hidden");
+      $("upreload").onclick = function(){ w.postMessage("skip"); };
+    };
+    sw.register("sw.js").then(function(reg){
+      offer(reg.waiting);
+      reg.addEventListener("updatefound", function(){
+        const w = reg.installing;
+        if(w) w.addEventListener("statechange", function(){
+          if(w.state === "installed") offer(w);
+        });
+      });
+    }).catch(function(){});
+    let swapped = false;
+    const had = !!sw.controller;
+    sw.addEventListener("controllerchange", function(){
+      if(swapped || !had) return;           // clients.claim() on first install
+      swapped = true; location.reload();
+    });
+  }
 })();
+
+$("foot").textContent = "Chess Trainer · build " + BUILD;
 
 Theme.apply();
 if(PERSONAL) setSide(side);
