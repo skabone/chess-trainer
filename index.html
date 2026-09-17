@@ -248,6 +248,17 @@
   .note{font-size:12px;color:var(--faint);line-height:1.5;border-left:2px solid var(--line);
     padding-left:10px;margin-top:12px}
   .hidden{display:none !important}
+  .prow{display:grid;grid-template-columns:1fr auto;gap:2px 10px;width:100%;text-align:left;
+    background:none;border:0;border-radius:8px;color:var(--ink);font:inherit;font-size:13.5px;
+    padding:8px 10px;cursor:pointer}
+  .prow:hover{background:var(--panel2)}
+  .prow.on{background:var(--panel2);box-shadow:inset 0 0 0 1px var(--line)}
+  .prow .pn{color:var(--dim);font-variant-numeric:tabular-nums}
+  .prow .pbar{grid-column:1 / -1;height:4px;border-radius:2px;background:var(--line);overflow:hidden}
+  .prow .pbar i{display:block;height:100%;background:var(--accent)}
+  .ptext{font-size:13.5px;line-height:1.5;margin-top:10px}
+  .ptext b{display:block;font-size:12px;color:var(--dim);font-weight:650;margin-bottom:2px}
+  #ptrend svg{width:100%;height:auto;display:block}
   .foot{margin-top:28px;font-size:12px;color:var(--faint)}
   .toast{position:fixed;left:50%;bottom:18px;transform:translateX(-50%);z-index:50;
     display:flex;align-items:center;gap:12px;padding:10px 12px 10px 16px;
@@ -452,40 +463,31 @@
     <div class="boardbar">
       <span class="turn" id="pturn"></span>
       <div class="row">
-        <button class="btn" id="pshow">Give up</button>
-        <button class="btn primary" id="pnext">Next &rarr;</button>
+        <button class="btn" id="pprev" aria-label="Previous position">&larr;</button>
+        <button class="btn primary" id="pshow">Show me</button>
+        <button class="btn" id="pnext" aria-label="Next position">&rarr;</button>
       </div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h2 id="pextitle">This position</h2>
+      <div class="path" id="pmeta"></div>
+      <div class="path hidden" id="palt" style="margin-top:10px"></div>
     </div>
   </div>
   <div>
     <div class="card">
-      <h2>Find a move that doesn't lose material</h2>
-      <div class="path" id="pmeta"></div>
-      <p class="muted" style="margin:10px 0 0" id="pask">
-        Drag nothing — just click the piece, then its square.</p>
+      <h2>Your blunder patterns</h2>
+      <div class="muted" id="pcount" style="margin-bottom:10px"></div>
+      <div id="plist"></div>
     </div>
 
-    <div class="card hidden" id="presult">
-      <h2>Result</h2>
-      <div id="pverdict"></div>
-      <div class="path" id="palt" style="margin-top:10px"></div>
+    <div class="card" id="pcard">
+      <h2 id="pname"></h2>
+      <p style="margin:0 0 10px" id="pwhat"></p>
+      <div class="ptext"><b>Why it happens</b><span id="pwhy"></span></div>
+      <div class="ptext"><b>What to look for</b><span id="plook"></span></div>
+      <div id="ptrend" style="margin-top:14px"></div>
       <div class="note" id="pnote"></div>
-    </div>
-
-    <div class="card">
-      <h2>Filter</h2>
-      <div class="row" id="pfilter">
-        <button class="btn" data-cost="0">All</button>
-        <button class="btn" data-cost="3">Piece or more</button>
-        <button class="btn" data-cost="5">Rook or more</button>
-        <button class="btn" data-cost="9">Queen</button>
-      </div>
-      <div class="muted" id="pcount" style="margin-top:10px"></div>
-    </div>
-
-    <div class="card">
-      <h2>Session</h2>
-      <div class="stat" id="pstats"></div>
     </div>
   </div>
 </section>
@@ -986,6 +988,101 @@ return {MIN_OPTION, MIN_BEST, MIN_POS, SHRINK, TIE, raw, adj, options, bestOptio
 })();
 if(typeof window !== "undefined") window.Score = Score;
 if(typeof module !== "undefined" && module.exports) module.exports = Score;
+</script>
+<script>/* Named blunder patterns: the words. build.py decides which pattern a blunder is
+ * (classify_blunder, from the position, your move and the capture that punished
+ * it); this file says what each one means, why it keeps happening and what to
+ * look at before moving. Pure text — node js/test.js checks every pattern the
+ * builder can emit has an entry here, and that none of it reads like a quiz. */
+const Patterns = (function(){
+"use strict";
+
+const TEXT = {
+  walked_into_it: {
+    name: "Moved onto an attacked square",
+    what: "You moved a piece to a square where it could simply be taken.",
+    why: "The move was chosen for what the piece would do from its new square, and the square itself never got a look. Pawns and knights are the usual culprits — their attacks are the easiest to stop seeing.",
+    look: "Before letting go of the piece, look at the square it is landing on and ask what can capture there — pawns first, then knights, then the long-range pieces.",
+  },
+  ignored_threat: {
+    name: "Left an attacked piece where it was",
+    what: "One of your pieces was already under attack, and the move you played did nothing about it.",
+    why: "You were following your own plan and did not ask what the opponent's last move was for. Most of these are one move deep: the threat was made on the move right before.",
+    look: "Start every turn from their last move, not your next one: what does that piece attack now that it did not attack before?",
+  },
+  bad_capture: {
+    name: "Captured and lost more on the recapture",
+    what: "You took something, the capturing piece was taken back, and the trade came out in their favour.",
+    why: "A capture feels like winning material, so the count stops one move early. The piece you took was defended, and the piece you took with was worth more.",
+    look: "Count the whole exchange on that square before capturing: what takes back, and is what you give worth more than what you get?",
+  },
+  greedy: {
+    name: "Grabbed material while something bigger hung",
+    what: "You captured something while a more valuable piece of yours was already attacked — and lost that instead.",
+    why: "The capture was the first thing you saw and it looked free. It was not the most urgent thing on the board.",
+    look: "When a capture is available, check your own attacked pieces first. If one of them is worth more than what you are about to take, deal with that.",
+  },
+  moved_the_defender: {
+    name: "Moved the piece that was guarding another",
+    what: "The piece you moved had been protecting one of your others; once it left, that piece fell.",
+    why: "Pieces do quiet jobs that are easy to forget. The move looked fine for the piece that moved — nobody asked what it had been holding.",
+    look: "Before moving a piece, ask what it is defending right now. If the answer is something that is attacked, it cannot leave yet.",
+  },
+  opened_the_line: {
+    name: "Unblocked an attack on your own piece",
+    what: "The piece you moved had been standing between an enemy bishop, rook or queen and one of your pieces. Moving it opened the line.",
+    why: "A blocked attack does not look like an attack. The long-range piece may have been sitting there for many moves, aimed at something through your own man.",
+    look: "Before moving a piece off a file or diagonal, look along it both ways: is there an enemy bishop, rook or queen on one side and one of your pieces on the other?",
+  },
+  castled_into_it: {
+    name: "Castled away from a piece that needed you",
+    what: "Your king or rook had been guarding something. Castling took the guard away, and it was captured.",
+    why: "Castling is played almost automatically, as a safe move that never needs checking. Here the king or the rook was doing a job.",
+    look: "Before castling, check what your king and that rook are protecting on their current squares.",
+  },
+  let_it_promote: {
+    name: "Let a pawn promote",
+    what: "An enemy pawn was one step from promoting and the move you played did not stop it.",
+    why: "A far-advanced pawn gets tuned out as part of the scenery, especially when there is something to do elsewhere.",
+    look: "Any enemy pawn on its seventh rank is the most urgent thing on the board. Deal with it before anything else.",
+  },
+  pinned_defender: {
+    name: "Counted on a defender that was pinned",
+    what: "The piece that fell looked protected, but its protector was pinned to your king and could not legally take back.",
+    why: "A pinned piece still looks like it guards things. It does not.",
+    look: "When you count defenders, leave out any piece that is pinned to your king.",
+  },
+  other: {
+    name: "Something else",
+    what: "Material was lost within one exchange, but not in one of the shapes above.",
+    why: "These are the rarer ones — blocking your own defender, for instance. They are kept together until there are enough of one kind to name.",
+    look: "Step through a few: if you see the same shape twice, log it and it can become a pattern of its own.",
+  },
+};
+
+/** Is this pattern getting rarer or more common? Compares the rate per 100
+ *  games over the last `span` months with the span before it. */
+function trend(per100, span){
+  span = span || 3;
+  if(per100.length < 2*span) return {dir: "flat", now: null, before: null};
+  const mean = a => a.reduce((s, v) => s + v, 0) / a.length;
+  const now = mean(per100.slice(-span)), before = mean(per100.slice(-2*span, -span));
+  const delta = now - before;
+  // under a quarter of a blunder per 100 games is noise, not a trend
+  const dir = Math.abs(delta) < 0.25 ? "flat" : delta < 0 ? "down" : "up";
+  return {dir, now: +now.toFixed(1), before: +before.toFixed(1)};
+}
+
+/** What a loss of this many pawns is, in words. */
+function lossWords(cost){
+  return cost >= 9 ? "your queen" : cost >= 5 ? "a rook" : cost >= 3 ? "a piece"
+       : cost + " pawns";
+}
+
+return {TEXT, trend, lossWords};
+})();
+if(typeof window !== "undefined") window.Patterns = Patterns;
+if(typeof module !== "undefined" && module.exports) module.exports = Patterns;
 </script>
 <script>/* Chess rules — 0x88 board, full legality, SAN/FEN, draw detection.
  *
@@ -2626,8 +2723,8 @@ window.Log = Log;
 </script>
 
 <script>
-const BUILD = "2026-09-17+e7a13c7";
-const DATA = {"me":"","white":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"black":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"habits":null,"puzzles":[]};
+const BUILD = "2026-09-17+99f7a1d";
+const DATA = {"me":"","white":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"black":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"habits":null,"puzzles":[],"patterns":null};
 
 /* ============================ board rendering ============================ */
 const GLYPH = {k:"♚",q:"♛",r:"♜",b:"♝",n:"♞",p:"♟"};
@@ -2966,119 +3063,107 @@ function applyMove(key, uci){
   return `${place} ${turn === "w" ? "b" : "w"} - -`;
 }
 
-const PZ = DATA.puzzles;
-let pFilter = 0, pPool = [], pCur = null, pDone = false, pSel = null;
-Object.assign(store, {pHits: store.pHits||0, pTries: store.pTries||0, pSeen: store.pSeen||{}});
+/* A pattern browser, not a quiz: what you keep doing, why, what to look at, and
+   real positions from your games to step through. build.py names the patterns
+   (classify_blunder); js/patterns.js holds the words. */
+const PT = DATA.patterns;
+const HELD = Object.fromEntries(DATA.puzzles.map(p => [p.fen, p]));
+let pId = null, pIdx = 0, pStep = 0;
+Object.assign(store, {pPattern: store.pPattern || null});
 
-function pBuild(){
-  pPool = PZ.filter(p => p.cost >= pFilter);
-  document.querySelectorAll("#pfilter [data-cost]").forEach(b =>
-    b.classList.toggle("primary", +b.dataset.cost === pFilter));
-  $("pcount").textContent =
-    `${pPool.length} of ${PZ.length} positions · ${PZ[PZ.length-1].date} to ${PZ[0].date}`;
+const pRow = () => PT.list.find(r => r.id === pId);
+const pEx = () => pRow().examples[pIdx];
+
+function pList(){
+  const top = Math.max(...PT.list.map(r => r.n), 1);
+  $("pcount").textContent = `${PT.total} times material was lost in one exchange, ` +
+    `${PT.months[0]} to ${PT.months[PT.months.length-1]} — sorted by how it happened.`;
+  $("plist").innerHTML = PT.list.filter(r => r.n).map(r => {
+    const t = Patterns.trend(r.per100);
+    const arrow = t.dir === "down" ? "↓ rarer lately" : t.dir === "up" ? "↑ more lately" : "steady";
+    return `<button class="prow ${r.id === pId ? "on" : ""}" data-pattern="${r.id}">
+      <span>${esc(Patterns.TEXT[r.id].name)}</span>
+      <span class="pn">${r.n} · ${r.share}%</span>
+      <span class="pbar"><i style="width:${(100*r.n/top).toFixed(1)}%"></i></span>
+      <span class="muted" style="grid-column:1 / -1">${arrow}</span></button>`;
+  }).join("");
+  $("plist").querySelectorAll("[data-pattern]").forEach(b =>
+    b.onclick = () => pSelect(b.dataset.pattern));
 }
 
-function pPick(){
-  if(!pPool.length) return null;
-  const fresh = pPool.filter(p => !store.pSeen[p.fen]);
-  const from = fresh.length ? fresh : pPool;
-  return from[Math.floor(Math.random()*from.length)];
+function pSelect(id){
+  pId = id; pIdx = 0; pStep = 0;
+  store.pPattern = id; save();
+  const r = pRow(), T = Patterns.TEXT[id];
+  $("pname").textContent = T.name;
+  $("pwhat").textContent = T.what;
+  $("pwhy").textContent = T.why;
+  $("plook").textContent = T.look;
+  pTrend(r);
+  $("pnote").innerHTML = `${r.n} times in ${PT.months.length} months, costing
+    ${Patterns.lossWords(Math.round(r.cost))} on average. Patterns are read from the position, your move
+    and the capture that punished it — one exchange deep, no engine — so slower
+    mistakes and missed mates are not in here.`;
+  pList(); pDraw();
 }
 
-function pNext(){
-  pCur = pPick(); pDone = false; pSel = null;
-  $("presult").classList.add("hidden");
-  $("pask").classList.remove("hidden");
-  if(!pCur){ $("pmeta").innerHTML = "<b>No positions match this filter.</b>"; return; }
-  const flip = pCur.me === "b";
-  renderBoard($("pboard"), pCur.fen, {flip});
-  $("pturn").innerHTML = `<b>${flip ? "Black" : "White"}</b> to move`;
-  const lost = pCur.cost >= 9 ? "your queen" : pCur.cost >= 5 ? "a rook"
-             : pCur.cost >= 3 ? "a piece" : `${pCur.cost} pawns`;
+/** Rate per 100 games, month by month — so a busy month doesn't read as a careless one. */
+function pTrend(r){
+  const W = 380, H = 96, ml = 8, mr = 8, mt = 18, mb = 18;
+  const v = r.per100, hi = Math.max(...v, 1);
+  const X = i => ml + i * (W - ml - mr) / Math.max(1, v.length - 1);
+  const Y = y => mt + (1 - y / hi) * (H - mt - mb);
+  const t = Patterns.trend(v);
+  const d = v.map((y, i) => (i ? "L" : "M") + X(i).toFixed(1) + " " + Y(y).toFixed(1)).join(" ");
+  const last = v.length - 1;
+  $("ptrend").innerHTML = svg(`0 0 ${W} ${H}`,
+    `<title>${esc(Patterns.TEXT[r.id].name)}: times per 100 games, by month</title>
+     <text x="${ml}" y="11" font-size="10.5" fill="${C_CTX}">per 100 games</text>
+     <line x1="${ml}" x2="${W-mr}" y1="${Y(0)}" y2="${Y(0)}" stroke="${C_CTX}" stroke-width="1" opacity=".5"/>
+     <path d="${d}" fill="none" stroke="${C_UP}" stroke-width="2" stroke-linejoin="round"/>
+     <circle cx="${X(last)}" cy="${Y(v[last])}" r="3.5" fill="${C_UP}"/>
+     <text x="${W-mr}" y="11" text-anchor="end" font-size="10.5" fill="var(--ink)">${v[last]} now</text>
+     <text x="${ml}" y="${H-4}" font-size="10.5" fill="${C_CTX}">${PT.months[0]}</text>
+     <text x="${W-mr}" y="${H-4}" text-anchor="end" font-size="10.5" fill="${C_CTX}">${PT.months[last]}</text>`) +
+    (t.now == null ? "" : `<div class="muted" style="margin-top:6px">Last three months: ${t.now} per 100 games;
+      the three before: ${t.before}.</div>`);
+}
+
+/* Three steps per position: the board as you saw it, your move, their capture. */
+function pDraw(){
+  const r = pRow(), ex = pEx();
+  const flip = ex.me === "b", side = flip ? "Black" : "White";
+  const afterMine = applyMove(ex.fen, ex.played_uci);
+  const sqs = u => ({[u.slice(0,2)]: "from", [u.slice(2,4)]: "to"});
+  if(pStep === 0) renderBoard($("pboard"), ex.fen, {flip});
+  if(pStep === 1) renderBoard($("pboard"), afterMine, {flip, highlight: sqs(ex.played_uci)});
+  if(pStep === 2) renderBoard($("pboard"), applyMove(afterMine, ex.punish_uci),
+                              {flip, highlight: sqs(ex.punish_uci)});
+  $("pturn").innerHTML = pStep === 0 ? `You are <b>${side}</b>, to move`
+    : pStep === 1 ? `You played <b>${esc(ex.played)}</b>` : `<b>${esc(ex.punish)}</b> followed`;
+  $("pshow").textContent = pStep === 0 ? "Show me" : pStep === 1 ? "And then" : "From the start";
+  $("pextitle").textContent = `Position ${pIdx + 1} of ${r.examples.length}`;
   $("pmeta").innerHTML =
-    `From your game on <b>${pCur.date}</b>, move ${Math.floor(pCur.ply/2)+1}. ` +
-    `Here you played something that cost <b>${lost}</b>` +
-    (pCur.spent != null ? ` — after ${pCur.spent}s of thought.` : ".") +
-    `<div class="muted" style="margin-top:8px">${pCur.safe.length} of
-      ${pCur.legal.length} legal moves keep your material.</div>`;
-  pHook();
-  pStats();
+    `From your game on <b>${ex.date}</b>, move ${Math.floor(ex.ply/2)+1}.` +
+    (pStep >= 1 ? ` You played <b>${esc(ex.played)}</b>.` : "") +
+    (pStep >= 2 ? ` <b>${esc(ex.punish)}</b> won ${Patterns.lossWords(ex.cost)}.` : "") +
+    (ex.url ? ` <a href="${ex.url}" target="_blank" rel="noopener" style="color:var(--accent)">Open the game</a>` : "");
+  const held = HELD[ex.fen];
+  $("palt").classList.toggle("hidden", !(pStep === 2 && held));
+  if(held) $("palt").innerHTML = `<b>Moves that kept everything:</b> ` +
+    held.safe.slice(0, 12).map(s => esc(s[0])).join(", ") +
+    (held.safe.length > 12 ? ` … and ${held.safe.length - 12} more` : "");
 }
 
-function pHook(){
-  $("pboard").onclick = e => {
-    if(pDone || !pCur) return;
-    const cell = e.target.closest(".sq"); if(!cell) return;
-    const name = cell.dataset.sq, flip = pCur.me === "b";
-    if(!pSel){
-      if(!pCur.legal.some(u => u.slice(0,2) === name)) return;
-      pSel = name;
-      renderBoard($("pboard"), pCur.fen, {flip,
-        highlight: Object.fromEntries([[name,"sel"]].concat(
-          pCur.legal.filter(u => u.slice(0,2) === name).map(u => [u.slice(2,4),"hint"])))});
-      return;
-    }
-    const hit = pCur.legal.find(u => u.slice(0,2) === pSel && u.slice(2,4) === name);
-    if(!hit){ pSel = null; renderBoard($("pboard"), pCur.fen, {flip}); return; }
-    pSel = null;
-    pAnswer(hit);
-  };
+function drawPuzzles(){
+  if(pId){ pDraw(); return; }
+  const first = PT.list.find(r => r.id === store.pPattern && r.n) || PT.list.find(r => r.n);
+  if(first) pSelect(first.id);
 }
 
-function pAnswer(uci, gaveUp){
-  pDone = true;
-  const safe = pCur.safe.find(s => s[1] === uci);
-  if(!gaveUp){
-    store.pTries++;
-    if(safe) store.pHits++;
-  }
-  store.pSeen[pCur.fen] = 1; save();
-
-  $("pask").classList.add("hidden");
-  $("presult").classList.remove("hidden");
-  const v = $("pverdict");
-  if(gaveUp){
-    v.className = "verdict meh";
-    v.innerHTML = `You played <b>${pCur.played}</b> here; <b>${pCur.punish}</b> punished it.`;
-  } else if(safe){
-    v.className = "verdict ok";
-    v.innerHTML = `<b>${safe[0]}</b> holds everything. In the game you played
-      <b>${pCur.played}</b> and <b>${pCur.punish}</b> followed.`;
-  } else {
-    v.className = "verdict no";
-    v.innerHTML = `That one loses material too. In the game you played
-      <b>${pCur.played}</b>, and <b>${pCur.punish}</b> followed.`;
-  }
-  const shown = pCur.safe.slice(0, 12).map(s => s[0]).join(", ");
-  $("palt").innerHTML = `<b>Moves that hold:</b> ${shown}` +
-    (pCur.safe.length > 12 ? ` … and ${pCur.safe.length-12} more` : "");
-  $("pnote").innerHTML =
-    `"Holds" means nothing can be captured for profit on the next move. It is a
-     safety check, not an engine evaluation — a safe move can still be a weak one.` +
-    (pCur.url ? ` <a href="${pCur.url}" target="_blank" rel="noopener"
-       style="color:var(--accent)">Open the game</a>` : "");
-
-  renderBoard($("pboard"), applyMove(pCur.fen, uci), {flip: pCur.me === "b",
-    highlight: {[uci.slice(0,2)]:"from", [uci.slice(2,4)]:"to"}});
-  pStats();
-}
-
-function pStats(){
-  const acc = store.pTries ? Math.round(100*store.pHits/store.pTries) : 0;
-  $("pstats").innerHTML = `
-    <div><div class="k">Attempted</div><div class="v">${store.pTries}</div></div>
-    <div><div class="k">Held material</div><div class="v">${acc}%</div></div>
-    <div><div class="k">Unseen</div>
-      <div class="v">${pPool.filter(p => !store.pSeen[p.fen]).length}</div></div>`;
-}
-
-function drawPuzzles(){ if(!pCur){ pBuild(); pNext(); } }
-
-document.querySelectorAll("#pfilter [data-cost]").forEach(b => b.onclick = () => {
-  pFilter = +b.dataset.cost; pBuild(); pNext();
-});
-$("pnext").onclick = () => pNext();
-$("pshow").onclick = () => { if(!pDone && pCur) pAnswer(pCur.safe[0][1], true); };
+$("pshow").onclick = () => { if(pId){ pStep = (pStep + 1) % 3; pDraw(); } };
+$("pnext").onclick = () => { if(pId){ pIdx = (pIdx + 1) % pRow().examples.length; pStep = 0; pDraw(); } };
+$("pprev").onclick = () => { if(pId){ const n = pRow().examples.length; pIdx = (pIdx + n - 1) % n; pStep = 0; pDraw(); } };
 
 /* ============================ habits ============================ */
 /* Two colours only: blue above the baseline, red below. Validated for CVD
@@ -3273,7 +3358,7 @@ function redrawAll(){
   try{
     if(current && !answered) renderBoard($("dboard"), current.key, {flip: side === "black"});
     if(!$("tab-explore").classList.contains("hidden")) drawExplore();
-    if(pCur && !pDone) renderBoard($("pboard"), pCur.fen, {flip: pCur.me === "b"});
+    if(pId) pDraw();
   } catch(e){ /* board not built yet */ }
 }
 
