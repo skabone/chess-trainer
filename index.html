@@ -45,6 +45,8 @@
   #tab-play{grid-template-columns:minmax(0,auto) minmax(300px,380px)}
   #tab-play.solo{grid-template-columns:minmax(0,auto)}
   #tab-play.solo .sidepanel{display:none}
+  /* must repeat the id: the two rules above out-specify .cols' own collapse */
+  @media(max-width:860px){#tab-play,#tab-play.solo{grid-template-columns:minmax(0,1fr)}}
   .wrap.wide{max-width:1560px}
 
   /* ---- board ---- */
@@ -85,6 +87,10 @@
   .boardbar{display:flex;justify-content:space-between;align-items:center;
     margin-top:10px;gap:10px;flex-wrap:wrap}
   .turn{font-size:13px;color:var(--dim)}
+  .turn.busy::before{content:"";display:inline-block;width:8px;height:8px;border-radius:50%;
+    margin-right:7px;background:currentColor;animation:pulse 1s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:.25}50%{opacity:1}}
+  @media(prefers-reduced-motion:reduce){.turn.busy::before{animation:none}}
   .turn b{color:var(--ink)}
 
   /* ---- panel ---- */
@@ -839,8 +845,11 @@ function piece(type, colour){
 /* ---------------------------------------------------------------- state */
 
 const LS = "chess-trainer-theme";
-const state = Object.assign({board:"walnut", set:"staunton"},
-  JSON.parse(localStorage.getItem(LS) || "{}"));
+function readState(){
+  try { const v = JSON.parse(localStorage.getItem(LS) || "{}"); return v && typeof v === "object" ? v : {}; }
+  catch(e){ return {}; }
+}
+const state = Object.assign({board:"walnut", set:"staunton"}, readState());
 
 function apply(){
   const b = BOARDS.find(x => x.id === state.board) || BOARDS[0];
@@ -1321,8 +1330,14 @@ const Engine = (function(){
 "use strict";
 
 let worker = null, booting = null;
-const waiters = [];          // {match(line), lines[], resolve}
-let onInfo = null;
+const waiters = [];          // {match(line), lines[], resolve, reject, timer}
+let onInfo = null, onDeath = null;
+let epoch = 0;               // bumped by stop(); queued searches from before it are dropped
+
+/* Every search carries a movetime cap as well as a depth, so a slow phone gets
+   a shallower answer rather than a frozen board. `grace` is how long past the
+   cap we wait before deciding the worker is dead. */
+const LIMITS = {bot: 5000, analyse: 6000, grace: 8000, boot: 30000};
 
 function spawn(){
   const loaderSrc = document.getElementById("sf-loader").textContent;
@@ -1333,23 +1348,40 @@ function spawn(){
     "for(var i=0;i<s.length;i++)a[i]=s.charCodeAt(i);return a;})();\n" +
     loaderSrc;
   const w = new Worker(URL.createObjectURL(new Blob([src], {type: "text/javascript"})));
+  w.onerror = e => { if(w === worker) die("engine crashed: " + ((e && e.message) || "unknown")); };
   w.onmessage = e => {
+    if(w !== worker) return;
     const line = typeof e.data === "string" ? e.data : String(e.data);
     if(onInfo && line.startsWith("info ")) onInfo(line);
     for(let i = waiters.length - 1; i >= 0; i--){
       waiters[i].lines.push(line);
-      if(waiters[i].match(line)){ waiters.splice(i,1)[0].resolve(line); }
+      if(waiters[i].match(line)){
+        const hit = waiters.splice(i,1)[0];
+        clearTimeout(hit.timer); hit.resolve(line);
+      }
     }
   };
   return w;
 }
 
-function send(cmd){ worker.postMessage(cmd); }
+/** The worker is gone or wedged. Fail everything waiting on it; the next call
+ *  to boot() starts a fresh one, so one dead worker never ends the session. */
+function die(why){
+  if(worker){ try { worker.terminate(); } catch(e){} }
+  worker = null; booting = null;
+  const err = new Error(why);
+  for(const rec of waiters.splice(0)){ clearTimeout(rec.timer); rec.reject(err); }
+  if(onDeath) onDeath(why);
+}
 
-/** Resolve once a line matching `test` arrives; collects everything until then. */
-function until(test){
-  return new Promise(resolve => {
-    const rec = {match: test, lines: [], resolve: () => resolve(rec.lines)};
+function send(cmd){ if(worker) worker.postMessage(cmd); }
+
+/** Resolve once a line matching `test` arrives; collects everything until then.
+ *  No answer within `ms` means the worker is dead, whatever it claims. */
+function until(test, ms){
+  return new Promise((resolve, reject) => {
+    const rec = {match: test, lines: [], resolve: () => resolve(rec.lines), reject};
+    rec.timer = setTimeout(() => die("engine stopped answering"), ms);
     waiters.push(rec);
   });
 }
@@ -1358,12 +1390,13 @@ async function boot(){
   if(booting) return booting;
   booting = (async () => {
     worker = spawn();
-    const p = until(l => l.startsWith("uciok"));
+    const p = until(l => l.startsWith("uciok"), LIMITS.boot);
     send("uci"); await p;
-    const r = until(l => l.startsWith("readyok"));
+    const r = until(l => l.startsWith("readyok"), LIMITS.boot);
     send("isready"); await r;
     return true;
   })();
+  booting.catch(() => {});
   return booting;
 }
 
@@ -1400,7 +1433,9 @@ function scalar(s){
 let queue = Promise.resolve();
 /** Engine calls are serialised — one search at a time. */
 function serial(fn){
-  const run = queue.then(fn, fn);
+  const mine = epoch;
+  const go = () => { if(mine !== epoch) throw new Error("cancelled"); return fn(); };
+  const run = queue.then(go, go);
   queue = run.catch(() => {});
   return run;
 }
@@ -1418,9 +1453,10 @@ function analyse(fen, opts){
     send("setoption name Skill Level value 20");
     send("setoption name MultiPV value " + multipv);
     send("ucinewgame");
-    const done = until(l => l.startsWith("bestmove"));
+    const cap = Math.min(opts.movetime || LIMITS.analyse, LIMITS.analyse);
+    const done = until(l => l.startsWith("bestmove"), cap + LIMITS.grace);
     send("position fen " + fen);
-    send(opts.movetime ? "go movetime " + opts.movetime : "go depth " + depth);
+    send(opts.movetime ? "go movetime " + cap : "go depth " + depth + " movetime " + cap);
     const lines = await done;
     const bm = lines[lines.length-1].split(/\s+/)[1];
     const byIdx = readScore(lines, multipv);
@@ -1463,9 +1499,9 @@ function botMove(fen, levelIdx, rng){
     send("setoption name Skill Level value " + L.skill);
     send("setoption name MultiPV value " + (L.slip > 0 ? 5 : 1));
     send("ucinewgame");
-    const done = until(l => l.startsWith("bestmove"));
+    const done = until(l => l.startsWith("bestmove"), LIMITS.bot + LIMITS.grace);
     send("position fen " + fen);
-    send("go depth " + L.depth);
+    send("go depth " + L.depth + " movetime " + LIMITS.bot);
     const lines = await done;
     const bm = lines[lines.length-1].split(/\s+/)[1];
     if(bm === "(none)" || !bm) return {uci: null, slipped: false};
@@ -1484,9 +1520,13 @@ function botMove(fen, levelIdx, rng){
 
 function ready(){ return booting !== null && worker !== null; }
 
-return {boot, analyse, botMove, LEVELS, scalar, ready,
+return {boot, analyse, botMove, LEVELS, LIMITS, scalar, ready,
         setInfoHandler(fn){ onInfo = fn; },
-        stop(){ if(worker) send("stop"); }};
+        onDeath(fn){ onDeath = fn; },
+        /** Abandon the current search and everything queued behind it. */
+        stop(){ epoch++; send("stop"); },
+        /** Test hook: kill the worker silently, the way a crashed tab process does. */
+        debugKill(){ if(worker) worker.terminate(); }};
 })();
 window.Engine = Engine;
 </script>
@@ -1674,6 +1714,9 @@ function setEvalBar(whitePov){
 async function review(state, rec){
   S = state;
   const me = S.mine, ply = S.game.history().length - 1;
+  /* A takeback or new game while the engine was thinking makes this review
+     stale; writing its note would land on a move that no longer exists. */
+  const gen = S.gen, stale = () => S.gen !== gen;
 
   /* Compare candidate moves at the SAME root and depth. Scoring a move by
      (eval before) - (eval after) instead looks reasonable but is biased: the
@@ -1682,6 +1725,7 @@ async function review(state, rec){
   let before;
   try { before = await Engine.analyse(rec.before, {depth: DEPTH, multipv: 4}); }
   catch(e){ return; }
+  if(stale()) return;
 
   const cands = before.all.filter(c => c.move);
   if(!cands.length) return;
@@ -1699,6 +1743,7 @@ async function review(state, rec){
     let after;
     try { after = await Engine.analyse(rec.after, {depth: Math.max(2, DEPTH - 1)}); }
     catch(e){ return; }
+    if(stale()) return;
     playedEval = -Engine.scalar(after.score);
     replyUci = after.best;
   }
@@ -1721,7 +1766,8 @@ async function review(state, rec){
   if(book){
     let bhtml = book;
     if(tip) bhtml += `<div class="note" style="margin-top:12px">${tip}</div>`;
-    S.notes[ply] = {tag: "", html: bhtml, loss, best: bestSan, book: true};
+    S.notes[ply] = {tag: "", html: bhtml, loss, best: bestSan, book: true,
+                    hidden: S.mode !== "coach"};
     if(S.mode === "coach") document.getElementById("gcoach").innerHTML = bhtml;
     return;
   }
@@ -1754,7 +1800,7 @@ async function review(state, rec){
     // rated games stay quiet until the end
     S.notes[ply].hidden = true;
     document.getElementById("gcoach").innerHTML =
-      '<p class="muted">Playing rated — feedback comes after the game.</p>';
+      '<p class="muted">Playing a real game — feedback comes after the game.</p>';
     return;
   }
   document.getElementById("gcoach").innerHTML = html;
@@ -1782,8 +1828,10 @@ function describePv(fen, pv){
 async function previewForUser(state){
   S = state;
   if(S.mode !== "coach" || S.over) return;
+  const gen = S.gen;
   try{
     const a = await Engine.analyse(S.game.fen(), {depth: 10});
+    if(S.gen !== gen) return;
     setEvalBar(fromPov(a.score, S.game.turn(), "w"));
   } catch(e){ /* engine busy — not worth interrupting play for */ }
 }
@@ -1835,7 +1883,83 @@ const S = {
   notes: [],           // per-ply coach notes, index = ply
   evals: [],           // per-ply eval after the move, from White's POV
   started: false,
+  flip: false,         // board orientation — independent of which colour you play
+  gen: 0,              // bumped whenever the game changes under a pending engine call
+  reviewing: false,
+  stalled: false,      // the engine failed twice; waiting for the user to retry
+  slips: [],           // plies where the bot deliberately played a worse move
+  takebacks: 0,
+  id: null, startedAt: null,
 };
+
+/* ------------------------------------------------------------ storage */
+
+const LSP = "chess-trainer-play";     // level, mode, side + the game in progress
+const GAMES = "chess-trainer-games";  // every finished bot game, newest last
+const MAX_GAMES = 500;
+let ready = false, sidePref = "w";
+
+function readJSON(key, fallback){
+  try { const v = JSON.parse(localStorage.getItem(key)); return v == null ? fallback : v; }
+  catch(e){ return fallback; }
+}
+function writeJSON(key, v){
+  try { localStorage.setItem(key, JSON.stringify(v)); } catch(e){ /* full or blocked */ }
+}
+
+const uciOf = m => m.from + m.to + (m.promotion || "");
+
+/** Saved after every ply, so a reload or a crashed tab costs nothing. */
+function persist(){
+  if(!ready) return;
+  writeJSON(LSP, {v: 1, level: S.level, mode: S.mode, side: sidePref, game: {
+    id: S.id, startedAt: S.startedAt, mine: S.mine, flip: S.flip,
+    moves: S.game.history().map(uciOf), notes: S.notes, evals: S.evals,
+    slips: S.slips, takebacks: S.takebacks, over: S.over, started: S.started}});
+}
+
+/** Rebuild a saved game by replaying it; anything that doesn't replay is dropped. */
+function restore(g){
+  if(!g || !Array.isArray(g.moves) || (g.mine !== "w" && g.mine !== "b")) return false;
+  const game = new Chess();
+  for(const u of g.moves){
+    if(typeof u !== "string" ||
+       !game.move({from: u.slice(0,2), to: u.slice(2,4), promotion: u[4] || undefined})) return false;
+  }
+  const n = g.moves.length;
+  S.game = game; S.mine = g.mine; S.flip = !!g.flip;
+  S.notes = Array.isArray(g.notes) ? g.notes.slice(0, n) : [];
+  S.evals = Array.isArray(g.evals) ? g.evals.slice(0, n) : [];
+  S.slips = Array.isArray(g.slips) ? g.slips.filter(i => i < n) : [];
+  const h = game.board.hist;
+  S.slips.forEach(i => { if(h[i]) h[i].slipped = true; });
+  S.takebacks = +g.takebacks || 0;
+  S.over = typeof g.over === "string" ? g.over : null;
+  S.started = !!g.started || n > 0;
+  S.id = g.id || newId(); S.startedAt = g.startedAt || new Date().toISOString();
+  S.view = n; S.sel = null; S.pending = null;
+  S.thinking = S.reviewing = S.stalled = false;
+  return true;
+}
+
+const newId = () => Date.now().toString(36) + Math.random().toString(36).slice(2, 6);
+
+/** One record per finished game. Re-finishing after a takeback replaces it. */
+function logGame(outcome, why){
+  const counts = {blunder: 0, mistake: 0, inacc: 0};
+  S.notes.forEach(n => { if(n && n.tag) counts[n.tag]++; });
+  const L = Engine.LEVELS[S.level];
+  const entry = {id: S.id, started: S.startedAt, ended: new Date().toISOString(),
+    outcome, why, level: S.level, bot: L.name, elo: L.elo, mode: S.mode, mine: S.mine,
+    plies: S.game.history().length, moves: S.game.history().map(m => m.san),
+    slips: S.slips.slice(), counts, takebacks: S.takebacks,
+    build: (typeof BUILD !== "undefined" ? BUILD : "dev")};
+  let all = readJSON(GAMES, []);
+  if(!Array.isArray(all)) all = [];
+  all = all.filter(g => g && g.id !== S.id);
+  all.push(entry);
+  writeJSON(GAMES, all.slice(-MAX_GAMES));
+}
 
 /* ------------------------------------------------------------ board */
 
@@ -1859,7 +1983,7 @@ function shownFen(){
 
 function draw(){
   const fen = shownFen();
-  const flip = S.mine === "b";
+  const flip = S.flip;
   const live = S.view >= S.game.history().length;
   const hl = {};
 
@@ -1896,13 +2020,17 @@ function draw(){
 function drawStatus(){
   const live = S.view >= S.game.history().length;
   const turn = S.game.turn();
-  let txt;
+  let txt, busy = false;
   if(S.over) txt = S.over;
   else if(!live) txt = `Reviewing move ${S.view} of ${S.game.history().length}`;
-  else if(S.thinking) txt = "Opponent is thinking…";
+  else if(S.stalled) txt = `The engine didn't answer. <button class="btn" id="gretrybot">Try again</button>`;
+  else if(S.thinking || (S.reviewing && S.mode !== "coach")){ txt = "Opponent is thinking…"; busy = true; }
+  else if(S.reviewing){ txt = "Coach is looking at your move…"; busy = true; }
   else txt = (turn === S.mine ? "Your move" : "Opponent to move") +
              (S.game.inCheck() ? " — check!" : "");
   $("gturn").innerHTML = `<b>${txt}</b>`;
+  $("gturn").classList.toggle("busy", busy);
+  if($("gretrybot")) $("gretrybot").onclick = botTurn;
   $("gback").disabled = S.view === 0;
   $("gfwd").disabled = live;
   $("gtake").disabled = !S.started || S.thinking || S.game.history().length < 1;
@@ -1929,9 +2057,12 @@ function drawMoves(){
   box.scrollTop = box.scrollHeight;
 }
 
+/** A real game stays silent until it ends — no dots, no notes, no eval. */
+const quiet = () => S.mode !== "coach" && !S.over;
+
 function noteDot(ply){
   const n = S.notes[ply];
-  if(!n || !n.tag) return "";
+  if(!n || !n.tag || n.hidden || quiet()) return "";
   return `<i class="dot ${n.tag}"></i>`;
 }
 
@@ -1968,32 +2099,44 @@ function askPromo(){
   });
 }
 
+/* Every await below can resume into a different game: a takeback, a new game
+   or a resignation bumps S.gen, and whoever was waiting simply stops. */
 async function afterHuman(rec){
   if(!rec) return;
+  const gen = S.gen;
   S.view = S.game.history().length;
   S.started = true;
-  draw();
+  persist(); draw();
   if(checkOver()) return;
-  if(window.Coach) await Coach.review(S, rec);
-  draw(); showNote();
-  if(checkOver()) return;
+  if(window.Coach){
+    S.reviewing = true; drawStatus();
+    await Coach.review(S, rec);
+    if(S.gen !== gen) return;
+    S.reviewing = false;
+  }
+  persist(); draw(); showNote();
   botTurn();
 }
 
 async function botTurn(){
-  S.thinking = true; drawStatus();
-  try{
-    const {uci, slipped} = await Engine.botMove(S.game.fen(), S.level);
-    if(!uci){ S.thinking = false; checkOver(); return; }
-    const rec = S.game.move({from: uci.slice(0,2), to: uci.slice(2,4),
-                             promotion: uci[4] || undefined});
-    if(rec) rec.slipped = slipped;
-  } catch(e){
-    console.error("bot failed", e);
+  const gen = S.gen;
+  S.thinking = true; S.stalled = false; drawStatus();
+  let res = null;
+  // a dead worker is respawned by the next call, so one retry usually recovers
+  for(let attempt = 0; attempt < 2 && !res; attempt++){
+    try { res = await Engine.botMove(S.game.fen(), S.level); }
+    catch(e){ if(S.gen === gen) console.error("bot failed", e); }
+    if(S.gen !== gen) return;
   }
   S.thinking = false;
+  if(!res){ S.stalled = true; drawStatus(); return; }
+  if(res.uci){
+    const rec = S.game.move({from: res.uci.slice(0,2), to: res.uci.slice(2,4),
+                             promotion: res.uci[4] || undefined});
+    if(rec && res.slipped){ rec.slipped = true; S.slips.push(S.game.history().length - 1); }
+  }
   S.view = S.game.history().length;
-  draw();
+  persist(); draw();
   if(!checkOver() && window.Coach) Coach.previewForUser(S);
 }
 
@@ -2002,26 +2145,43 @@ function checkOver(){
   const res = S.game.result(), why = S.game.overReason();
   const iWon = (res === "1-0" && S.mine === "w") || (res === "0-1" && S.mine === "b");
   S.over = res === "1/2-1/2" ? `Draw — ${why}` : (iWon ? `You win by ${why}` : `You lose by ${why}`);
-  drawStatus();
-  if(window.Coach) Coach.gameOver(S);
+  finish(res === "1/2-1/2" ? "draw" : (iWon ? "win" : "loss"), why);
   return true;
 }
 
+function finish(outcome, why){
+  logGame(outcome, why);
+  persist(); drawStatus();
+  if(window.Coach) Coach.gameOver(S);
+  drawMoves();
+}
+
 function takeback(){
-  if(!S.game.history().length) return;
+  if(!S.game.history().length || S.thinking) return;
+  // whatever the engine was doing for the old position no longer applies
+  S.gen++; Engine.stop();
+  S.reviewing = false; S.stalled = false;
   // undo back to the user's own turn
   S.game.undo();
   if(S.game.history().length && S.game.turn() !== S.mine) S.game.undo();
-  S.notes.length = S.game.history().length;
-  S.evals.length = S.game.history().length;
+  const n = S.game.history().length;
+  S.notes.length = Math.min(S.notes.length, n);
+  S.evals.length = Math.min(S.evals.length, n);
+  S.slips = S.slips.filter(i => i < n);
+  S.takebacks++;
   S.over = null; S.sel = null;
-  S.view = S.game.history().length;
-  draw(); showNote();
+  S.view = n;
+  persist(); draw(); showNote();
+  if(S.game.turn() !== S.mine) botTurn();    // took back to before the bot's first move
 }
 
 function showNote(){
   const n = S.notes[S.view - 1];
   const box = $("gcoach");
+  if(quiet() || (n && n.hidden)){
+    box.innerHTML = '<p class="muted">Playing a real game — feedback comes after the game.</p>';
+    return;
+  }
   if(!n){ box.innerHTML = '<p class="muted">Play a move and I\'ll tell you what it did.</p>'; return; }
   box.innerHTML = n.html;
 }
@@ -2029,18 +2189,21 @@ function showNote(){
 /* ------------------------------------------------------------ lifecycle */
 
 function newGame(){
+  S.gen++; Engine.stop();              // drop any move still being thought about
   S.game = new Chess();
   S.view = 0; S.sel = null; S.over = null; S.notes = []; S.evals = [];
   S.started = false; S.thinking = false; S.pending = null;
+  S.reviewing = false; S.stalled = false; S.slips = []; S.takebacks = 0;
+  S.flip = S.mine === "b";
+  S.id = newId(); S.startedAt = new Date().toISOString();
   $("gpromo").classList.add("hidden");
-  if(S.mine === "b") { draw(); botTurn(); }
-  else draw();
-  showNote();
   if(window.Coach) Coach.reset(S);
+  persist(); draw(); showNote();
+  if(S.mine === "b") botTurn();
 }
 
 function setLevel(i){
-  S.level = i;
+  S.level = i; persist();
   document.querySelectorAll("#glevels [data-lvl]").forEach(b =>
     b.classList.toggle("primary", +b.dataset.lvl === i));
   const L = Engine.LEVELS[i];
@@ -2058,9 +2221,12 @@ function setMode(m){
     : "No help during the game. You get the full walkthrough at the end.";
   $("gtake").classList.toggle("hidden", m !== "coach");
   if(window.Coach) Coach.reset(S);
+  persist();
+  if(ready){ drawMoves(); if(!S.over) showNote(); }
 }
 
 function setSide(c){
+  sidePref = c;
   S.mine = c === "random" ? (Math.random() < 0.5 ? "w" : "b") : c;
   document.querySelectorAll("#gsides [data-side]").forEach(b =>
     b.classList.toggle("primary", b.dataset.side === c));
@@ -2082,13 +2248,15 @@ function init(){
   document.querySelector(".wrap").classList.add("wide");
   $("gnew").onclick = newGame;
   $("gtake").onclick = takeback;
-  $("gflip").onclick = () => { S.mine = S.mine === "w" ? "b" : "w"; draw(); };
+  $("gflip").onclick = () => { S.flip = !S.flip; persist(); draw(); };
   $("gback").onclick = () => { if(S.view > 0){ S.view--; S.sel=null; draw(); showNote(); } };
   $("gfwd").onclick  = () => { if(S.view < S.game.history().length){ S.view++; S.sel=null; draw(); showNote(); } };
   $("gresign").onclick = () => {
     if(S.over || !S.started) return;
-    S.over = "You resigned"; drawStatus();
-    if(window.Coach) Coach.gameOver(S);
+    S.gen++; Engine.stop();
+    S.thinking = S.reviewing = S.stalled = false;
+    S.over = "You resigned";
+    finish("loss", "resignation");
   };
 
   const lv = $("glevels");
@@ -2107,9 +2275,27 @@ function init(){
     if(e.key === "ArrowRight") $("gfwd").click();
   });
 
-  setLevel(3); setMode("coach");
-  document.querySelector('#gsides [data-side="w"]').classList.add("primary");
-  newGame();
+  const saved = readJSON(LSP, {}) || {};
+  setLevel(Number.isInteger(saved.level) && Engine.LEVELS[saved.level] ? saved.level : 3);
+  setMode(saved.mode === "rated" ? "rated" : "coach");
+  sidePref = ["w","b","random"].includes(saved.side) ? saved.side : "w";
+  document.querySelector(`#gsides [data-side="${sidePref}"]`).classList.add("primary");
+
+  if(restore(saved.game)){
+    ready = true;
+    if(window.Coach) Coach.reset(S);
+    draw();
+    if(S.over){ if(window.Coach) Coach.gameOver(S); drawMoves(); }
+    else {
+      showNote();
+      if(S.game.turn() !== S.mine) botTurn();
+      else if(window.Coach) Coach.previewForUser(S);
+    }
+  } else {
+    if(sidePref === "b") S.mine = "b";
+    ready = true;
+    newGame();
+  }
 }
 
 let booted = false;
@@ -2344,7 +2530,7 @@ window.Log = Log;
 </script>
 
 <script>
-const BUILD = "2026-08-11+22ee7a6";
+const BUILD = "2026-09-17+ee284d0";
 const DATA = {"me":"","white":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"black":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"habits":null,"puzzles":[]};
 
 /* ============================ board rendering ============================ */
@@ -2426,8 +2612,14 @@ function bestOption(node){
 
 /* ============================ state ============================ */
 const LS = "chess-trainer-v1";
-const store = Object.assign({side:"black", seen:{}, hits:0, tries:0},
-  JSON.parse(localStorage.getItem(LS) || "{}"));
+/* A corrupt value here used to throw at boot and take every tab down with it. */
+function readStore(){
+  try { const v = JSON.parse(localStorage.getItem(LS) || "{}"); return v && typeof v === "object" ? v : {}; }
+  catch(e){ return {}; }
+}
+const store = Object.assign({side:"black", seen:{}, hits:0, tries:0}, readStore());
+if(store.side !== "white" && store.side !== "black") store.side = "black";
+if(!store.seen || typeof store.seen !== "object") store.seen = {};
 const save = () => localStorage.setItem(LS, JSON.stringify(store));
 
 let side = store.side;
