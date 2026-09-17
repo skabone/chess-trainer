@@ -108,6 +108,7 @@
   .sq.hint.cap::before{width:100%;height:100%;background:none;
     box-shadow:inset 0 0 0 .9cqw #00000042}
   .sq.cur{outline:3px solid var(--accent);outline-offset:-3px;z-index:1}
+  .sq.tip{box-shadow:inset 0 0 0 4px var(--accent)}
   .sq.pre::after{content:"";position:absolute;inset:0;background:#d4685f66}
   .sq.lift .p{opacity:.25}
   #gboard{touch-action:none}
@@ -343,6 +344,7 @@
         <div id="gpromo" class="promo hidden"></div>
       </div>
     </div>
+    <div id="gask" class="hidden" style="margin:10px 0 0"></div>
     <div class="boardbar">
       <span class="turn" id="gturn"></span>
       <div class="row">
@@ -359,6 +361,8 @@
       <button class="btn" id="gsound" type="button" aria-pressed="true">Sound on</button>
       <button class="btn" id="gpremove" type="button" aria-pressed="false"
               title="Queue your reply while the opponent is thinking">Premove off</button>
+      <button class="btn" id="gnudge" type="button" aria-pressed="true"
+              title="In Coach mode, ask before a move that leaves a piece to be taken">Warnings on</button>
       <span class="msg" id="gsanmsg" role="status"></span>
     </form>
   </div>
@@ -389,6 +393,7 @@
       <div class="row">
         <button class="btn primary" id="gnew">New game</button>
         <button class="btn" id="gtake">Take back</button>
+        <button class="btn" id="ghint" title="Where to look, then the move">Hint</button>
         <button class="btn" id="gresign">Resign</button>
       </div>
     </div>
@@ -401,6 +406,7 @@
     <div class="card">
       <h2>Coach</h2>
       <div id="gcoach"></div>
+      <button class="btn hidden" id="gretry" style="margin-top:10px">Try again from here</button>
     </div>
 
     <div class="card">
@@ -2225,7 +2231,7 @@ function parseEntry(text, legal){
 /* ------------------------------------------------------------ prefs + sound */
 
 const LS = "chess-trainer-feel";
-const prefs = {sound: true, premove: false};
+const prefs = {sound: true, premove: false, nudge: true};
 try { Object.assign(prefs, JSON.parse(localStorage.getItem(LS)) || {}); } catch(e){ /* node, or blocked */ }
 function setPref(k, v){
   prefs[k] = v;
@@ -2428,6 +2434,50 @@ function hangDetail(afterFen, me, bestReplyUci){
   return {san: m.san, lost, victim};
 }
 
+/** Before a move is played: does it hand over material on the very next move?
+ *  null, or {sq, piece, loss, text} for the worst thing it leaves to be taken.
+ *  Pure, and built on js/tactics.js — no engine, so it answers at once. Says
+ *  nothing when the move is mate, when it is safe by the blunder finder's own
+ *  test, or when no move on the board is safe (nagging cannot help then). */
+function nudge(fen, spec){
+  if(typeof Tactics === "undefined") return null;
+  const g = new Chess(fen), me = g.turn();
+  const m = g.moves().find(x => x.from === spec.from && x.to === spec.to &&
+    (!spec.promotion || x.promotion === spec.promotion));
+  if(!m || Tactics.isSafe(g, m)) return null;
+  if(!g.moves().some(x => Tactics.isSafe(g, x))) return null;
+  // what the move itself wins counts: an even trade "hangs" the piece that took, and is fine
+  const took = m.flags.includes("e") ? 1 : m.flags.includes("c") ? Tactics.VAL["pnbrqk".indexOf(g.get(m.to).type) + 1] : 0;
+  g.move({from: m.from, to: m.to, promotion: m.promotion});
+  const worst = Tactics.hanging(g, me)[0];
+  if(!worst || worst.loss - took < Tactics.BLUNDER_COST) return null;
+  const mine = worst.sq === m.to ? `That puts your ${worst.piece} on ${worst.sq} where it can be taken`
+                                 : `That leaves your ${worst.piece} on ${worst.sq} to be taken`;
+  return {sq: worst.sq, piece: worst.piece, loss: worst.loss - took, san: m.san,
+          text: `${mine}. ${Tactics.why(g, worst.sq)}`};
+}
+
+/** A hint in two steps: first where to look, then the move. `best` is a UCI move
+ *  from the engine; the words about loose pieces come from js/tactics.js. */
+function hintText(fen, best, step){
+  const g = new Chess(fen), me = g.turn(), them = me === "w" ? "b" : "w";
+  const m = g.moves().find(x => x.from === best.slice(0,2) && x.to === best.slice(2,4) &&
+    (!best[4] || x.promotion === best[4]));
+  if(!m) return null;
+  const NAMES = {p: "pawn", n: "knight", b: "bishop", r: "rook", q: "queen", k: "king"};
+  const piece = NAMES[g.get(m.from).type];
+  if(step >= 2) return {from: m.from, to: m.to, html: `The move is <b>${m.san}</b>.`};
+  let why = `Look at your ${piece} on ${m.from}.`;
+  if(typeof Tactics !== "undefined"){
+    const mineLoose = Tactics.hanging(g, me)[0], theirs = Tactics.hanging(g, them)[0];
+    if(theirs && theirs.sq === m.to) why = `Something of theirs can be taken for nothing. ${why}`;
+    else if(mineLoose && mineLoose.loss >= 2)
+      why = `Your ${mineLoose.piece} on ${mineLoose.sq} is in trouble. ` +
+            (mineLoose.sq === m.from ? `It is the piece to move.` : why);
+  }
+  return {from: m.from, to: null, html: why};
+}
+
 /** The verdict line for a reviewed move. Pure wording — no engine, no DOM. */
 function verdict(cls, played, bestSan, hang, loss){
   if(cls.tag){
@@ -2543,8 +2593,6 @@ async function review(state, rec){
     return;
   }
   document.getElementById("gcoach").innerHTML = html;
-  const rt = document.getElementById("gretry");
-  if(rt) rt.classList.toggle("hidden", !cls.tag);
 }
 
 /** Turn the engine's principal variation into a readable sentence. */
@@ -2569,10 +2617,27 @@ async function previewForUser(state){
   if(S.mode !== "coach" || S.over) return;
   const gen = S.gen;
   try{
-    const a = await Engine.analyse(S.game.fen(), {depth: 10});
+    const fen = S.game.fen();
+    const a = await Engine.analyse(fen, {depth: 10});
     if(S.gen !== gen) return;
+    lastPreview = {fen, best: a.best};
     setEvalBar(fromPov(a.score, S.game.turn(), "w"));
   } catch(e){ /* engine busy — not worth interrupting play for */ }
+}
+
+/** A hint for the position on the board, reusing the preview search when it is
+ *  for this position. Coach mode only: a real game gets nothing, whoever asks. */
+async function hint(state, step){
+  S = state;
+  if(S.mode !== "coach" || S.over || S.game.turn() !== S.mine) return null;
+  const gen = S.gen, fen = S.game.fen();
+  if(!lastPreview || lastPreview.fen !== fen){
+    let a;
+    try { a = await Engine.analyse(fen, {depth: 10}); } catch(e){ return null; }
+    if(S.gen !== gen || S.game.fen() !== fen) return null;
+    lastPreview = {fen, best: a.best};
+  }
+  return lastPreview.best ? hintText(fen, lastPreview.best, step) : null;
 }
 
 function gameOver(state){
@@ -2593,8 +2658,8 @@ function gameOver(state){
   S.notes.forEach(n => { if(n) n.hidden = false; });
 }
 
-return {reset, review, previewForUser, gameOver, principles, principleTip, fmtEval,
-        CLASS, classify, verdict, fromPov, hangDetail};
+return {reset, review, previewForUser, hint, gameOver, principles, principleTip, fmtEval,
+        CLASS, classify, verdict, fromPov, hangDetail, nudge, hintText};
 })();
 
 /* `const` at top level does not become a window property, and play.js guards on
@@ -2633,6 +2698,9 @@ const S = {
   id: null, startedAt: null,
   cur: null,           // keyboard cursor square, shown only while the board has focus
   premove: null,       // {from, to} queued during the bot's turn (option, off by default)
+  ask: null,           // {spec, warn} — a move waiting on "that hangs a piece — sure?"
+  tip: null,           // {fen, step, from, to} — the hint showing for this position
+  hints: 0, nudges: 0, // asked for / shown this game; logged with the game
 };
 let drag = null;       // {from, x, y, ghost, wasSel} while a pointer is down on one of your pieces
 let shown = -1;        // the ply the board last drew, so draw() knows which move to animate
@@ -2661,7 +2729,8 @@ function persist(){
   writeJSON(LSP, {v: 1, level: S.level, mode: S.mode, side: sidePref, game: {
     id: S.id, startedAt: S.startedAt, mine: S.mine, flip: S.flip,
     moves: S.game.history().map(uciOf), notes: S.notes, evals: S.evals,
-    slips: S.slips, takebacks: S.takebacks, over: S.over, started: S.started}});
+    slips: S.slips, takebacks: S.takebacks, hints: S.hints, nudges: S.nudges,
+    over: S.over, started: S.started}});
 }
 
 /** Rebuild a saved game by replaying it; anything that doesn't replay is dropped. */
@@ -2679,7 +2748,8 @@ function restore(g){
   S.slips = Array.isArray(g.slips) ? g.slips.filter(i => i < n) : [];
   const h = game.board.hist;
   S.slips.forEach(i => { if(h[i]) h[i].slipped = true; });
-  S.takebacks = +g.takebacks || 0;
+  S.takebacks = +g.takebacks || 0; S.hints = +g.hints || 0; S.nudges = +g.nudges || 0;
+  S.ask = null; S.tip = null;
   S.over = typeof g.over === "string" ? g.over : null;
   S.started = !!g.started || n > 0;
   S.id = g.id || newId(); S.startedAt = g.startedAt || new Date().toISOString();
@@ -2698,7 +2768,7 @@ function logGame(outcome, why){
   const entry = {id: S.id, started: S.startedAt, ended: new Date().toISOString(),
     outcome, why, level: S.level, bot: L.name, elo: L.elo, mode: S.mode, mine: S.mine,
     plies: S.game.history().length, moves: S.game.history().map(m => m.san),
-    slips: S.slips.slice(), counts, takebacks: S.takebacks,
+    slips: S.slips.slice(), counts, takebacks: S.takebacks, hints: S.hints, nudges: S.nudges,
     build: (typeof BUILD !== "undefined" ? BUILD : "dev")};
   let all = readJSON(GAMES, []);
   if(!Array.isArray(all)) all = [];
@@ -2742,6 +2812,8 @@ function draw(){
       hl[m.to] = hl[m.to] || (m.san.includes("x") ? "hint cap" : "hint");
   }
   if(S.premove && live){ hl[S.premove.from] = "pre"; hl[S.premove.to] = "pre"; }
+  if(S.tip && live && S.tip.fen === S.game.fen() && !quiet())
+    for(const k of [S.tip.from, S.tip.to]) if(k) hl[k] = (hl[k] ? hl[k] + " " : "") + "tip";
   const focused = $("gboard").matches(":focus-visible");
 
   const ranks = flip ? [1,2,3,4,5,6,7,8] : [8,7,6,5,4,3,2,1];
@@ -2806,6 +2878,7 @@ function drawStatus(){
   $("gback").disabled = S.view === 0;
   $("gfwd").disabled = live;
   $("gtake").disabled = !S.started || S.thinking || S.game.history().length < 1;
+  $("ghint").disabled = !!S.over || !live || turn !== S.mine || S.thinking;
 }
 
 function drawMoves(){
@@ -2840,8 +2913,28 @@ function noteDot(ply){
 
 /* ------------------------------------------------------------ moving */
 
+/* Every move of yours goes through here. In Coach mode a move that hands over
+   material is asked about once first (Coach.nudge, built on js/tactics.js); a
+   real game is never interrupted, and neither is a premove. */
+function human(spec){
+  const warn = S.mode === "coach" && Feel.prefs.nudge && window.Coach ? Coach.nudge(S.game.fen(), spec) : null;
+  if(!warn) return commit(spec);
+  S.ask = {spec, warn}; S.sel = null; S.nudges++;
+  draw(); showNote();
+  say(`${warn.text} Play it anyway?`);
+  return null;
+}
+
+function commit(spec){
+  S.ask = null; S.sel = null; $("gask").classList.add("hidden");
+  const rec = S.game.move(spec);
+  afterHuman(rec);
+  return rec;
+}
+
 function onSquare(name){
   if(S.over) return;
+  if(S.ask){ S.ask = null; showNote(); }
   if(S.view < S.game.history().length){ S.view = S.game.history().length; S.sel = null; draw(); return; }
   if(S.game.turn() !== S.mine){ queuePremove(name); return; }
   if(S.thinking) return;
@@ -2850,9 +2943,7 @@ function onSquare(name){
     const opts = S.game.moves(S.sel).filter(m => m.to === name);
     if(opts.length){
       if(opts.length > 1 && opts[0].promotion){ S.pending = {from: S.sel, to: name}; S.sel = null; askPromo(); return; }
-      const rec = S.game.move({from: S.sel, to: name});
-      S.sel = null;
-      afterHuman(rec);
+      human({from: S.sel, to: name});
       return;
     }
   }
@@ -2894,10 +2985,10 @@ function askPromo(){
     `<button class="pbtn" data-p="${t}" aria-label="Promote to ${Feel.NAMES[t]}"><span class="p ${S.mine}" aria-hidden="true">${PIECE[t]}</span></button>`).join("");
   const keys = document.activeElement === $("gboard");
   $("gpromo").querySelectorAll("[data-p]").forEach(b => b.onclick = () => {
-    const rec = S.game.move({from: S.pending.from, to: S.pending.to, promotion: b.dataset.p});
+    const spec = {from: S.pending.from, to: S.pending.to, promotion: b.dataset.p};
     S.pending = null; $("gpromo").classList.add("hidden");
     if(keys) $("gboard").focus();
-    afterHuman(rec);
+    human(spec);
   });
   if(keys){ $("gpromo").querySelector("[data-p]").focus(); say("Choose a piece to promote to."); }
 }
@@ -2908,7 +2999,7 @@ async function afterHuman(rec){
   if(!rec) return;
   const gen = S.gen;
   S.view = S.game.history().length;
-  S.started = true; S.premove = null;
+  S.started = true; S.premove = null; S.tip = null; S.ask = null;
   persist(); draw();
   Feel.sound(Feel.soundOf(rec));
   say(`You played ${Feel.sayMove(rec)}.`);
@@ -2969,11 +3060,11 @@ function finish(outcome, why){
   drawMoves();
 }
 
-function takeback(){
-  if(!S.game.history().length || S.thinking) return;
+function takeback(force){
+  if(!S.game.history().length || (S.thinking && force !== true)) return;
   // whatever the engine was doing for the old position no longer applies
   S.gen++; Engine.stop();
-  S.reviewing = false; S.stalled = false;
+  S.reviewing = false; S.stalled = false; S.thinking = false;
   // undo back to the user's own turn
   S.game.undo();
   if(S.game.history().length && S.game.turn() !== S.mine) S.game.undo();
@@ -2982,15 +3073,65 @@ function takeback(){
   S.evals.length = Math.min(S.evals.length, n);
   S.slips = S.slips.filter(i => i < n);
   S.takebacks++;
-  S.over = null; S.sel = null; S.premove = null;
+  S.over = null; S.sel = null; S.premove = null; S.ask = null; S.tip = null;
   S.view = n;
   persist(); draw(); showNote();
   if(S.game.turn() !== S.mine) botTurn();    // took back to before the bot's first move
+  else if(window.Coach) Coach.previewForUser(S);
+}
+
+/* Retry from here: the coach has just called your last move a slip. Put the
+   position back as it was before it — even if the bot is already thinking —
+   and say so; the note about the move is gone with the move. */
+function lastMine(){
+  const n = S.game.history().length;
+  return S.game.turn() === S.mine ? n - 2 : n - 1;
+}
+function canRetry(){
+  const n = S.notes[lastMine()];
+  return S.mode === "coach" && !S.ask && S.view >= S.game.history().length && !!n && !!n.tag && !n.hidden;
+}
+function retry(){
+  if(!canRetry()) return;
+  const i = lastMine(), was = S.game.history()[i].san, n = S.notes[i];
+  takeback(true);
+  $("gcoach").innerHTML = `<div class="verdict meh"><b>Back before ${was}.</b> Same position — look for what it missed` +
+    (n.best ? `, or ask for a hint` : "") + `.</div>`;
+  say(`Back before ${was}. Your move.`);
+}
+
+/* Hint: first press says where to look, second shows the move. */
+async function hint(){
+  if(quiet() || S.mode !== "coach" || !window.Coach) return;
+  const fen = S.game.fen();
+  const step = S.tip && S.tip.fen === fen ? Math.min(2, S.tip.step + 1) : 1;
+  $("ghint").disabled = true;
+  const h = await Coach.hint(S, step);
+  drawStatus();
+  if(!h || S.game.fen() !== fen || quiet()) return;
+  if(step === 1) S.hints++;
+  S.tip = {fen, step, from: h.from, to: h.to};
+  persist(); draw();
+  $("gcoach").innerHTML = `<div class="verdict ok"><b>Hint.</b> ${h.html}</div>` +
+    (step === 1 ? `<p class="muted" style="margin:8px 0 0">Press Hint again to see the move.</p>` : "");
+  say($("gcoach").textContent);
 }
 
 function showNote(){
   const n = S.notes[S.view - 1];
   const box = $("gcoach");
+  $("gretry").classList.toggle("hidden", !canRetry());
+  // the question sits right under the board: on a phone the Coach card is a long scroll away
+  const asking = !!S.ask && !quiet();
+  $("gask").classList.toggle("hidden", !asking);
+  $("gask").innerHTML = !asking ? "" :
+    `<div class="verdict meh"><b>Before you play ${S.ask.warn.san}:</b> ${S.ask.warn.text}</div>
+     <div class="row" style="margin-top:10px"><button class="btn primary" id="gaskno">Let me think again</button>
+     <button class="btn" id="gaskyes">Play it anyway</button></div>`;
+  if(asking){
+    $("gaskno").onclick = () => { S.ask = null; showNote(); say("Move not played. Your move."); };
+    $("gaskyes").onclick = () => { const a = S.ask; if(a) commit(a.spec); };
+  }
   if(quiet() || (n && n.hidden)){
     box.innerHTML = '<p class="muted">Playing a real game — feedback comes after the game.</p>';
     return;
@@ -3008,6 +3149,7 @@ function newGame(){
   S.started = false; S.thinking = false; S.pending = null;
   S.reviewing = false; S.stalled = false; S.slips = []; S.takebacks = 0;
   S.premove = null; S.cur = null; shown = -1;
+  S.ask = null; S.tip = null; S.hints = 0; S.nudges = 0;
   S.flip = S.mine === "b";
   S.id = newId(); S.startedAt = new Date().toISOString();
   $("gpromo").classList.add("hidden");
@@ -3034,6 +3176,9 @@ function setMode(m){
     ? "Every move gets feedback as you play, and you can take moves back and try again."
     : "No help during the game. You get the full walkthrough at the end.";
   $("gtake").classList.toggle("hidden", m !== "coach");
+  $("ghint").classList.toggle("hidden", m !== "coach");
+  $("gnudge").classList.toggle("hidden", m !== "coach");
+  S.ask = null; S.tip = null;
   if(window.Coach) Coach.reset(S);
   persist();
   if(ready){ drawMoves(); if(!S.over) showNote(); }
@@ -3130,10 +3275,9 @@ function init(){
     else if(S.game.turn() !== S.mine || S.thinking) err = "Wait for the opponent's move.";
     const res = err ? {error: err} : Feel.parseEntry(box.value, S.game.moves());
     if(res.error){ msg.textContent = res.error; return; }
-    const rec = S.game.move({from: res.move.from, to: res.move.to, promotion: res.move.promotion});
-    box.value = ""; msg.textContent = rec ? `Played ${rec.san}` : "";
-    S.sel = null;
-    afterHuman(rec);
+    if(S.ask){ S.ask = null; showNote(); }
+    const rec = human({from: res.move.from, to: res.move.to, promotion: res.move.promotion});
+    box.value = ""; msg.textContent = rec ? `Played ${rec.san}` : S.ask ? "The coach has a question first." : "";
   };
   const soundBtn = () => { const on = Feel.prefs.sound;
     $("gsound").textContent = on ? "Sound on" : "Sound off"; $("gsound").setAttribute("aria-pressed", on); };
@@ -3152,6 +3296,12 @@ function init(){
   document.querySelector(".wrap").classList.add("wide");
   $("gnew").onclick = newGame;
   $("gtake").onclick = takeback;
+  $("ghint").onclick = hint;
+  $("gretry").onclick = retry;
+  const nudgeBtn = () => { const on = Feel.prefs.nudge;
+    $("gnudge").textContent = on ? "Warnings on" : "Warnings off"; $("gnudge").setAttribute("aria-pressed", on); };
+  $("gnudge").onclick = () => { Feel.setPref("nudge", !Feel.prefs.nudge); S.ask = null; nudgeBtn(); showNote(); };
+  nudgeBtn();
   $("gflip").onclick = () => { S.flip = !S.flip; persist(); draw(); };
   $("gback").onclick = () => { if(S.view > 0){ S.view--; S.sel=null; draw(); showNote(); } };
   $("gfwd").onclick  = () => { if(S.view < S.game.history().length){ S.view++; S.sel=null; draw(); showNote(); } };
@@ -3206,7 +3356,7 @@ function init(){
 let booted = false;
 return {
   show(){ if(!booted){ booted = true; init(); } Engine.boot(); },
-  state: S, draw, showNote,
+  state: S, draw, showNote, hint, retry,
 };
 })();
 
@@ -3435,7 +3585,7 @@ window.Log = Log;
 </script>
 
 <script>
-const BUILD = "2026-09-17+3249359";
+const BUILD = "2026-09-17+82191cc";
 const DATA = {"me":"","white":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"black":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"habits":null,"puzzles":[],"patterns":null};
 
 /* ============================ board rendering ============================ */
