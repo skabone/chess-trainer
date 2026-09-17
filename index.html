@@ -276,7 +276,7 @@
 
 <nav role="tablist">
   <button role="tab" data-tab="play"    aria-selected="true">Play</button>
-  <button role="tab" data-tab="drill"   aria-selected="false">Drill</button>
+  <button role="tab" data-tab="drill"   aria-selected="false">Repertoire</button>
   <button role="tab" data-tab="explore" aria-selected="false">Explore</button>
   <button role="tab" data-tab="weak"    aria-selected="false">Weak spots</button>
   <button role="tab" data-tab="puzzles" aria-selected="false">Blunders</button>
@@ -353,15 +353,16 @@
   </div>
 </section>
 
-<!-- ============ DRILL ============ -->
+<!-- ============ REPERTOIRE GUIDE ============ -->
 <section id="tab-drill" class="cols hidden">
   <div class="boardwrap">
     <div class="board" id="dboard"></div>
     <div class="boardbar">
       <span class="turn" id="dturn"></span>
       <div class="row">
-        <button class="btn" id="dskip">Skip</button>
-        <button class="btn primary" id="dnext">Next &rarr;</button>
+        <button class="btn" id="dprev" aria-label="Previous position">&larr;</button>
+        <button class="btn" id="dexplore">Open in Explore</button>
+        <button class="btn primary" id="dnext" aria-label="Next position">&rarr;</button>
       </div>
     </div>
   </div>
@@ -375,30 +376,31 @@
       <div class="muted" id="dpool" style="margin-top:10px"></div>
     </div>
 
-    <div class="card">
-      <h2>Position</h2>
+    <div class="card" id="dguide">
+      <h2 id="dname"></h2>
       <div class="path" id="dpath"></div>
+      <div id="dverdict" style="margin-top:12px"></div>
+      <h2>The plan</h2>
+      <p id="dplan" style="margin:0 0 4px;line-height:1.55"></p>
     </div>
 
-    <div class="card" id="dask">
-      <h2>Your move</h2>
-      <p class="muted" style="margin:0 0 10px">Play it on the board, or pick from the moves
-        you've actually tried here.</p>
+    <div class="card">
+      <h2>What you have played here</h2>
+      <p class="muted" style="margin:0 0 10px">Pick a move to see it on the board.</p>
       <div class="moves" id="dmoves"></div>
-    </div>
-
-    <div class="card hidden" id="dresult">
-      <h2>Result</h2>
-      <div id="dverdict"></div>
-      <div class="moves" id="dall"></div>
       <div class="note">Ranked by your results, adjusted for sample size — a move with
         6 games is pulled toward your average until it earns its number.
         This is what has worked <i>for you</i>, not what an engine calls best.</div>
     </div>
 
+    <div class="card hidden" id="dbl"></div>
+
     <div class="card">
-      <h2>Session</h2>
-      <div class="stat" id="dstats"></div>
+      <h2>Your decision points</h2>
+      <p class="muted" style="margin:0 0 10px">Positions you reach often where you have
+        played more than one move enough to compare. The ones where a change would help
+        most come first.</p>
+      <div id="dlist"></div>
     </div>
   </div>
 </section>
@@ -935,7 +937,7 @@ return {piece, paint, apply, refresh, mountPicker, BOARDS, SETS, state};
 if(typeof window !== "undefined") window.Theme = Theme;
 if(typeof module !== "undefined" && module.exports) module.exports = Theme;
 </script>
-<script>/* Drill scoring: how a move's record is turned into "your best move here".
+<script>/* Repertoire scoring: how a move's record is turned into "your best move here".
  * Pure — no DOM, no storage — so node js/test.js can hold it to account. */
 const Score = (function(){
 "use strict";
@@ -945,7 +947,7 @@ const MIN_OPTION = 6;    // shown as a real choice
 const MIN_BEST   = 10;   // eligible to be the answer
 const MIN_POS    = 8;    // position must have been reached this often
 const SHRINK     = 25;   // pseudo-games pulling small samples toward your average
-const TIE        = 0.03; // within 3 points of the best counts as right
+const TIE        = 0.03; // within 3 points of the best is level, not better
 
 const raw = n => n.n ? (n.w + 0.5*n.d) / n.n : 0;
 
@@ -962,12 +964,12 @@ function bestOption(node){
   return elig.reduce((a,b) => adj(b,prior) > adj(a,prior) ? b : a);
 }
 
-/** Is this position a fair drill question? Returns its pool entry, or null. */
+/** Is this position a real decision point? Returns its pool entry, or null. */
 function drillEntry(key, nd){
   if(nd.n < MIN_POS) return null;
   const o = options(nd);
   if(o.length < 2) return null;
-  // a fair question needs at least two moves you've played enough to compare
+  // a real decision needs at least two moves you've played enough to compare
   if(o.filter(m => m.n >= MIN_BEST).length < 2) return null;
   const best = bestOption(nd);
   if(!best) return null;
@@ -977,14 +979,7 @@ function drillEntry(key, nd){
   return {key, node: nd, best, gap, weight: Math.log(nd.n) * (0.01 + gap)};
 }
 
-/** Grade a drill answer: right means a real sample within TIE of the best. */
-function grade(node, best, picked){
-  const prior = raw(node);
-  const delta = adj(best, prior) - adj(picked, prior);
-  return {delta, right: picked.n >= MIN_BEST && delta <= TIE};
-}
-
-return {MIN_OPTION, MIN_BEST, MIN_POS, SHRINK, TIE, raw, adj, options, bestOption, drillEntry, grade};
+return {MIN_OPTION, MIN_BEST, MIN_POS, SHRINK, TIE, raw, adj, options, bestOption, drillEntry};
 })();
 if(typeof window !== "undefined") window.Score = Score;
 if(typeof module !== "undefined" && module.exports) module.exports = Score;
@@ -1083,6 +1078,74 @@ return {TEXT, trend, lossWords};
 })();
 if(typeof window !== "undefined") window.Patterns = Patterns;
 if(typeof module !== "undefined" && module.exports) module.exports = Patterns;
+</script>
+<script>/* Repertoire guide: the words. The archive says what you play and how it scores;
+ * this file says what the opening is called, what you are trying to do in it and
+ * the idea behind each move. Entries are written as a move line so they can be
+ * read, and resolved to a POSITION at load (index()), so a transposition finds
+ * the same plan. The words are general chess; YOUR numbers never go in here —
+ * the page prints those live, and they would go stale and leak. No entry is an honest "no plan yet", never a guess.
+ * node js/test.js replays every line and checks every idea is a legal move. */
+const Repertoire = (function(){
+"use strict";
+
+/* A better move needs this many games before the guide recommends it outright;
+   between Score.MIN_BEST and this it is "promising, not proven". */
+const SOLID = 20;
+
+const BOOK = [
+  
+];
+
+const keyOfLine = (Chess, line) => {
+  const g = new Chess();
+  for(const san of line.split(" ").filter(Boolean)) if(!g.move(san)) return null;
+  return g.posKey();
+};
+
+/** Resolve BOOK to positions: {names: key → name, plans: key → entry}. */
+function index(Chess){
+  const names = {}, plans = {};
+  for(const e of BOOK){
+    const key = keyOfLine(Chess, e.line);
+    if(!key) continue;
+    if(e.name) names[key] = e.name;
+    if(e.plan) plans[key] = e;
+  }
+  return {names, plans};
+}
+
+/** The name of the deepest named position on the way to this one, or null. */
+function nameFor(Chess, idx, line){
+  const g = new Chess(), keys = [g.posKey()];
+  for(const san of line){ if(!g.move(san)) break; keys.push(g.posKey()); }
+  for(let i = keys.length - 1; i >= 0; i--) if(idx.names[keys[i]]) return idx.names[keys[i]];
+  return null;
+}
+
+/** What the archive says about one position: your habit, what has done better
+ *  and how far to trust it. `kind` picks the sentence; nothing here is a grade.
+ *    keep      your usual move is also your best
+ *    level     something edges it, but inside the noise
+ *    promising a better move on a thin sample (< SOLID games)
+ *    better    a better move on a real sample                              */
+function advice(Score, node){
+  const opts = Score.options(node);
+  if(!opts.length) return null;
+  const prior = Score.raw(node);
+  const habit = opts.reduce((a, b) => b.n > a.n ? b : a);
+  const best = Score.bestOption(node);
+  if(!best) return {habit, best: null, gap: 0, kind: "thin"};
+  const gap = Score.adj(best, prior) - Score.adj(habit, prior);
+  const kind = best.san === habit.san ? "keep" : gap <= Score.TIE ? "level"
+             : best.n < SOLID ? "promising" : "better";
+  return {habit, best, gap, kind};
+}
+
+return {SOLID, BOOK, index, nameFor, advice};
+})();
+if(typeof window !== "undefined") window.Repertoire = Repertoire;
+if(typeof module !== "undefined" && module.exports) module.exports = Repertoire;
 </script>
 <script>/* Chess rules — 0x88 board, full legality, SAN/FEN, draw detection.
  *
@@ -1486,6 +1549,15 @@ Game.prototype.overReason = function(){
   return null;
 };
 
+/** Position identity, the way build.py's pos_key() writes it: the first four FEN
+ *  fields, with the en-passant square kept only when a capture there is legal.
+ *  fen() names it after every double push; the archive's keys do not. */
+Game.prototype.posKey = function(){
+  const p = this.fen().split(" ").slice(0, 4);
+  if(p[3] !== "-" && !this.board.legal().some(m => m.flags.includes("e"))) p[3] = "-";
+  return p.join(" ");
+};
+
 /** Node count to `depth`. The correctness gate — see test_perft.js. */
 Game.prototype.perft = function(depth){
   const b = this.board;
@@ -1824,7 +1896,9 @@ const CLASS = [
 ];
 const classify = loss => CLASS.find(c => loss >= c.min);
 
-const first4 = fen => fen.split(" ").slice(0, 4).join(" ");
+/* Not a plain FEN prefix: after 1.e4 the FEN says "e3" and the archive says "-",
+   so every position after a double pawn push used to miss its book note. */
+const first4 = fen => new Chess(fen).posKey();
 
 /** What your own games say about this position — better evidence than a
  *  shallow search while still in known territory. */
@@ -2723,7 +2797,7 @@ window.Log = Log;
 </script>
 
 <script>
-const BUILD = "2026-09-17+99f7a1d";
+const BUILD = "2026-09-17+a5c11d1";
 const DATA = {"me":"","white":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"black":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"habits":null,"puzzles":[],"patterns":null};
 
 /* ============================ board rendering ============================ */
@@ -2791,9 +2865,9 @@ function readStore(){
   try { const v = JSON.parse(localStorage.getItem(LS) || "{}"); return v && typeof v === "object" ? v : {}; }
   catch(e){ return {}; }
 }
-const store = Object.assign({side:"black", seen:{}, hits:0, tries:0}, readStore());
+const store = Object.assign({side:"black", guide:{}}, readStore());
 if(store.side !== "white" && store.side !== "black") store.side = "black";
-if(!store.seen || typeof store.seen !== "object") store.seen = {};
+if(!store.guide || typeof store.guide !== "object") store.guide = {};
 const save = () => localStorage.setItem(LS, JSON.stringify(store));
 
 let side = store.side;
@@ -2803,8 +2877,11 @@ const node  = key => POS()[key];
 
 const $ = id => document.getElementById(id);
 
-/* ============================ drill ============================ */
-let pool = [], current = null, answered = false, sel = null;
+/* ============================ repertoire guide ============================ */
+/* Guidance, not questions: what the opening is, what you usually play, how it
+   scores, what has done better and the idea behind it. Words: js/repertoire.js. */
+const BOOKIDX = Repertoire.index(Chess);
+let pool = [], current = null, shown = null;
 
 function buildPool(){
   const me = side === "black" ? "b" : "w";
@@ -2818,17 +2895,6 @@ function buildPool(){
   pool.sort((a,b) => b.weight - a.weight);
 }
 
-function pickDrill(){
-  if(!pool.length) return null;
-  const fresh = pool.filter(p => (store.seen[p.key]||0) < 3);
-  const from = fresh.length ? fresh : pool;
-  const span = Math.max(1, Math.min(from.length, 25));
-  let pick, guard = 0;
-  do { pick = from[Math.floor(Math.random()*span)]; guard++; }
-  while(current && pick.key === current.key && guard < 12 && from.length > 1);
-  return pick;
-}
-
 function lineText(line, bold){
   if(!line.length) return "<b>starting position</b>";
   const out = [];
@@ -2839,33 +2905,8 @@ function lineText(line, bold){
   return out.join(" ");
 }
 
-function nextDrill(){
-  current = pickDrill();
-  answered = false; sel = null;
-  $("dresult").classList.add("hidden");
-  $("dask").classList.remove("hidden");
-  if(!current){
-    $("dpath").innerHTML = "<b>No positions with enough games here.</b>";
-    $("dboard").innerHTML = ""; $("dmoves").innerHTML = "";
-    return;
-  }
-  const nd = current.node;
-  renderBoard($("dboard"), current.key, {flip: side === "black"});
-  $("dpath").innerHTML = lineText(nd.line, true) +
-    `<div class="muted" style="margin-top:8px">Reached ${nd.n} times ·
-     you score ${pctOf(raw(nd))}% from here</div>`;
-  $("dturn").innerHTML = `<b>${side === "black" ? "Black" : "White"}</b> to move`;
-
-  const box = $("dmoves"); box.innerHTML = "";
-  for(const m of options(nd).slice().sort(() => Math.random()-.5)){
-    const b = document.createElement("button");
-    b.className = "mv";
-    b.innerHTML = `<span class="san">${m.san}</span><span class="n"></span><span class="sc"></span>`;
-    b.onclick = () => answer(m);
-    box.appendChild(b);
-  }
-  hookBoardClicks();
-}
+const openingName = nd => Repertoire.nameFor(Chess, BOOKIDX, nd.line);
+const KIND_TAG = {keep: "keep it", level: "no clear winner", promising: "worth a try", better: "worth changing"};
 
 function moveRow(m, cls){
   const s = raw(m);
@@ -2879,87 +2920,132 @@ function moveRow(m, cls){
   return b;
 }
 
-function answer(picked){
-  if(answered) return;
-  answered = true;
-  const nd = current.node, best = current.best, prior = raw(nd);
-  store.seen[current.key] = (store.seen[current.key]||0) + 1;
-  store.tries++;
-  const {delta, right} = Score.grade(nd, best, picked);
-  if(right) store.hits++;
-  save();
+function guideList(){
+  const box = $("dlist"); box.innerHTML = "";
+  if(!pool.length){ box.innerHTML = '<p class="muted">No positions with enough games here.</p>'; return; }
+  for(const e of pool){
+    const a = Repertoire.advice(Score, e.node);
+    const b = document.createElement("button");
+    b.className = "prow" + (current && e.key === current.key ? " on" : "");
+    b.innerHTML = `<span>${lineText(e.node.line, true)}</span>
+      <span class="pn">${KIND_TAG[a.kind] || ""}</span>
+      <span class="muted" style="grid-column:1 / -1;font-size:12px">${openingName(e.node) || "No name for this one yet"} · reached ${e.node.n} times</span>`;
+    b.onclick = () => { guideSelect(e.key); $("dguide").scrollIntoView({block: "nearest"}); };
+    box.appendChild(b);
+  }
+}
 
-  $("dask").classList.add("hidden");
-  $("dresult").classList.remove("hidden");
+function guideSelect(key){
+  current = pool.find(e => e.key === key) || pool[0] || null;
+  shown = null;
+  if(current){ store.guide = Object.assign({}, store.guide, {[side]: current.key}); save(); }
+  guideDraw(); guideList();
+}
 
+function guideStep(d){
+  if(!pool.length) return;
+  const i = pool.findIndex(e => current && e.key === current.key);
+  guideSelect(pool[(i + d + pool.length) % pool.length].key);
+}
+
+function guideBoard(){
+  if(!current){ $("dboard").innerHTML = ""; return; }
+  if(shown) renderBoard($("dboard"), shown.to, {flip: side === "black",
+    highlight: {[shown.uci.slice(0,2)]:"from", [shown.uci.slice(2,4)]:"to"}});
+  else renderBoard($("dboard"), current.key, {flip: side === "black"});
+  $("dturn").innerHTML = shown ? `After <b>${shown.san}</b>`
+    : `<b>${side === "black" ? "Black" : "White"}</b> to move`;
+}
+
+function guideDraw(){
+  guideBoard();
+  if(!current){
+    $("dname").textContent = "Nothing to show yet";
+    $("dpath").innerHTML = "<b>No positions with enough games here.</b>";
+    $("dverdict").innerHTML = $("dplan").textContent = $("dmoves").innerHTML = "";
+    $("dbl").classList.add("hidden");
+    return;
+  }
+  const nd = current.node, prior = raw(nd);
+  const a = Repertoire.advice(Score, nd), entry = BOOKIDX.plans[current.key];
+  const ideas = (entry && entry.ideas) || {};
+  $("dname").textContent = openingName(nd) || "No name for this one yet";
+  $("dpath").innerHTML = lineText(nd.line, true) +
+    `<div class="muted" style="margin-top:8px">Reached ${nd.n} times ·
+     you score ${pctOf(prior)}% from here</div>`;
+
+  const usual = `You usually play <b>${a.habit.san}</b> here — ${a.habit.n} of ${nd.n} games,
+    scoring ${pctOf(raw(a.habit))}%.`;
   const v = $("dverdict");
-  if(picked.n < MIN_BEST){
+  if(a.kind === "keep"){
+    v.className = "verdict ok";
+    v.innerHTML = `${usual} Of the moves you have played enough to judge, it is also your best. Keep playing it.`;
+  } else if(a.kind === "level"){
+    v.className = "verdict ok";
+    v.innerHTML = `${usual} <b>${a.best.san}</b> shows ${pctOf(raw(a.best))}% over ${a.best.n} games,
+      but once sample size is counted the two are level. No reason to change.`;
+  } else if(a.kind === "promising"){
     v.className = "verdict meh";
-    v.innerHTML = `<b>${picked.san}</b> shows ${pctOf(raw(picked))}%, but over only
-      ${picked.n} games — too thin to trust. Of the moves you've played enough to judge,
-      <b>${best.san}</b> is your best: ${pctOf(raw(best))}% over ${best.n} games.`;
-  } else if(picked.san === best.san){
-    v.className = "verdict ok";
-    v.innerHTML = `<b>${picked.san}</b> — your best here: ${pctOf(raw(picked))}% over ${picked.n} games.`;
-  } else if(right){
-    v.className = "verdict ok";
-    v.innerHTML = `<b>${picked.san}</b> is fine — statistically level with <b>${best.san}</b>
-      once sample size is accounted for.`;
+    v.innerHTML = `${usual} <b>${a.best.san}</b> has scored ${pctOf(raw(a.best))}% — but over only
+      ${a.best.n} games. Promising, not proven: worth trying, not yet worth trusting.`;
   } else {
-    v.className = delta < 0.06 ? "verdict meh" : "verdict no";
-    v.innerHTML = `<b>${picked.san}</b> scores ${pctOf(raw(picked))}% over ${picked.n} games.
-      <b>${best.san}</b> has done better — ${pctOf(raw(best))}% over ${best.n} games,
-      worth about <b>${(100*delta).toFixed(0)} points a game</b>.`;
+    v.className = "verdict meh";
+    v.innerHTML = `${usual} <b>${a.best.san}</b> has done better: ${pctOf(raw(a.best))}% over
+      ${a.best.n} games — worth about <b>${(100*a.gap).toFixed(0)} points a game</b>
+      after adjusting for sample size.`;
   }
-
+  if(a.best && a.best.san !== a.habit.san)
+    v.innerHTML += `<div style="margin-top:8px"><b>The idea behind ${a.best.san}:</b> ${
+      ideas[a.best.san] ? esc(ideas[a.best.san]) : "no note written for this move yet."}</div>`;
   // when nothing here works, the move choice isn't the problem — the line is
-  if(raw(best) < 0.45){
+  if(a.best && raw(a.best) < 0.45)
     v.innerHTML += `<div style="margin-top:8px;opacity:.85;font-size:12.5px">
-      You score ${pctOf(raw(nd))}% from this position no matter what you pick.
+      You score ${pctOf(prior)}% from this position whatever you play.
       This is a line to <b>avoid earlier</b>, not to optimise here.</div>`;
+
+  $("dplan").textContent = entry ? entry.plan
+    : "No plan written for this position yet — the numbers are all there is for now.";
+
+  const box = $("dmoves"); box.innerHTML = "";
+  for(const m of options(nd).slice().sort((x,y) => adj(y,prior) - adj(x,prior))){
+    const row = moveRow(m, (a.best && m.san === a.best.san ? "best " : "") +
+                           (shown && m.san === shown.san ? "picked" : ""));
+    row.style.cursor = "pointer";
+    const tags = [m.san === a.habit.san ? "your usual move" : "",
+                  a.best && m.san === a.best.san && a.kind !== "keep" ? "best results" : ""].filter(Boolean);
+    row.insertAdjacentHTML("beforeend",
+      `<span class="muted" style="grid-column:1 / -1;font-size:12.5px;line-height:1.5">${
+        tags.length ? `<b>${tags.join(" · ")}.</b> ` : ""}${ideas[m.san] ? esc(ideas[m.san]) : ""}</span>`);
+    row.onclick = () => { shown = shown && shown.san === m.san ? null : m; guideDraw(); };
+    box.appendChild(row);
   }
 
-  const all = $("dall"); all.innerHTML = "";
-  for(const m of options(nd).slice().sort((a,b) => adj(b,prior) - adj(a,prior))){
-    all.appendChild(moveRow(m,
-      (m.san === best.san ? "best " : "") + (m.san === picked.san ? "picked" : "")));
+  // where this opening's points really go: material dropped later in these games
+  const bl = $("dbl"), all = node(START());
+  bl.classList.toggle("hidden", !(nd.bl && PT));
+  if(nd.bl && PT){
+    const rate = x => (10 * (x.bl||0) / x.n).toFixed(1);
+    const T = Patterns.TEXT[nd.bp];
+    bl.innerHTML = `<h2>Later in these games</h2>
+      <p style="margin:0 0 10px;line-height:1.55">In the ${nd.n} games that went through this position
+      you dropped material <b>${nd.bl}</b> times — ${rate(nd)} per 10 games, against ${rate(all)}
+      across all your games as ${side === "black" ? "Black" : "White"}.
+      ${T ? `Most often: <b>${esc(T.name.toLowerCase())}</b>.` : ""}</p>
+      <button class="btn" id="dblgo">See that pattern</button>`;
+    $("dblgo").onclick = () => { show("puzzles"); drawPuzzles(); if(T) pSelect(nd.bp); };
   }
-
-  renderBoard($("dboard"), picked.to, {
-    flip: side === "black",
-    highlight: {[picked.uci.slice(0,2)]:"from", [picked.uci.slice(2,4)]:"to"}
-  });
-  drawStats();
 }
 
-function hookBoardClicks(){
-  $("dboard").onclick = e => {
-    if(answered || !current) return;
-    const cell = e.target.closest(".sq"); if(!cell) return;
-    const name = cell.dataset.sq, opts = options(current.node);
-    if(!sel){
-      if(!opts.some(m => m.uci.slice(0,2) === name)) return;
-      sel = name;
-      renderBoard($("dboard"), current.key, {
-        flip: side === "black",
-        highlight: Object.fromEntries([[name,"sel"]].concat(
-          opts.filter(m => m.uci.slice(0,2) === name).map(m => [m.uci.slice(2,4), "hint"])))
-      });
-    } else {
-      const hit = opts.find(m => m.uci.slice(0,2) === sel && m.uci.slice(2,4) === name);
-      sel = null;
-      if(hit) answer(hit);
-      else renderBoard($("dboard"), current.key, {flip: side === "black"});
-    }
-  };
-}
-
-function drawStats(){
-  const acc = store.tries ? Math.round(100*store.hits/store.tries) : 0;
-  $("dstats").innerHTML = `
-    <div><div class="k">Answered</div><div class="v">${store.tries}</div></div>
-    <div><div class="k">Picked best</div><div class="v">${acc}%</div></div>
-    <div><div class="k">Pool</div><div class="v">${pool.length}</div></div>`;
+/** Open a tree position in Explore by replaying its most common line. */
+function exploreTo(nd){
+  stack = [];
+  let k = START();
+  for(const san of nd.line){
+    const m = node(k).mv.find(x => x.san === san);
+    if(!m) break;
+    stack.push({key: m.to, san}); k = m.to;
+  }
+  show("explore"); drawExplore();
 }
 
 /* ============================ explore ============================ */
@@ -3016,16 +3102,7 @@ function drawWeak(){
       <td class="num">${r.nd.n}</td>
       <td class="num" style="color:${scoreColor(r.s)};font-weight:650">${pctOf(r.s)}%</td>
       <td class="num" style="color:${d<0?"var(--bad)":"var(--good)"}">${d>=0?"+":""}${(100*d).toFixed(1)}</td>`;
-    tr.onclick = () => {
-      stack = [];
-      let k = START();
-      for(const san of r.nd.line){
-        const m = node(k).mv.find(x => x.san === san);
-        if(!m) break;
-        stack.push({key: m.to, san}); k = m.to;
-      }
-      show("explore"); drawExplore();
-    };
+    tr.onclick = () => exploreTo(r.nd);
     body.appendChild(tr);
   }
   if(!rows.length) body.innerHTML = '<tr><td colspan="4" class="muted">Not enough games.</td></tr>';
@@ -3134,6 +3211,10 @@ function pDraw(){
   const r = pRow(), ex = pEx();
   const flip = ex.me === "b", side = flip ? "Black" : "White";
   const afterMine = applyMove(ex.fen, ex.played_uci);
+  // the opening this game came out of (build.py link_blunders)
+  const exSide = flip ? "black" : "white";
+  const from = ex.node && ex.node !== DATA[exSide].start ? DATA[exSide].pos[ex.node] : null;
+  const fromName = from && Repertoire.nameFor(Chess, BOOKIDX, from.line);
   const sqs = u => ({[u.slice(0,2)]: "from", [u.slice(2,4)]: "to"});
   if(pStep === 0) renderBoard($("pboard"), ex.fen, {flip});
   if(pStep === 1) renderBoard($("pboard"), afterMine, {flip, highlight: sqs(ex.played_uci)});
@@ -3147,7 +3228,10 @@ function pDraw(){
     `From your game on <b>${ex.date}</b>, move ${Math.floor(ex.ply/2)+1}.` +
     (pStep >= 1 ? ` You played <b>${esc(ex.played)}</b>.` : "") +
     (pStep >= 2 ? ` <b>${esc(ex.punish)}</b> won ${Patterns.lossWords(ex.cost)}.` : "") +
-    (ex.url ? ` <a href="${ex.url}" target="_blank" rel="noopener" style="color:var(--accent)">Open the game</a>` : "");
+    (ex.url ? ` <a href="${ex.url}" target="_blank" rel="noopener" style="color:var(--accent)">Open the game</a>` : "") +
+    (from ? `<div style="margin-top:6px">It came out of ${fromName ? `your <b>${esc(fromName)}</b>: ` : ""}${lineText(from.line)}.
+       <a href="#" id="pfrom" style="color:var(--accent)">Open that opening</a></div>` : "");
+  if(from) $("pfrom").onclick = e => { e.preventDefault(); if(store.side !== exSide) setSide(exSide); exploreTo(from); };
   const held = HELD[ex.fen];
   $("palt").classList.toggle("hidden", !(pStep === 2 && held));
   if(held) $("palt").innerHTML = `<b>Moves that kept everything:</b> ` +
@@ -3356,7 +3440,7 @@ function drawHabits(){
 /* Repaint whichever non-Play board is on screen after a theme change. */
 function redrawAll(){
   try{
-    if(current && !answered) renderBoard($("dboard"), current.key, {flip: side === "black"});
+    guideBoard();
     if(!$("tab-explore").classList.contains("hidden")) drawExplore();
     if(pId) pDraw();
   } catch(e){ /* board not built yet */ }
@@ -3392,15 +3476,16 @@ function setSide(s){
   buildPool(); stack = [];
   $("dpool").textContent =
     `${node(START()).n} games as ${s} · ${Object.keys(POS()).length} positions · ` +
-    `${pool.length} real decisions to drill`;
-  nextDrill(); drawStats();
+    `${pool.length} decision points`;
+  guideSelect(store.guide[s]);
   if(!$("tab-explore").classList.contains("hidden")) drawExplore();
   if(!$("tab-weak").classList.contains("hidden")) drawWeak();
 }
 document.querySelectorAll(REP_SIDES).forEach(b => b.onclick = () => setSide(b.dataset.side));
 
-$("dnext").onclick = nextDrill;
-$("dskip").onclick = nextDrill;
+$("dnext").onclick = () => guideStep(1);
+$("dprev").onclick = () => guideStep(-1);
+$("dexplore").onclick = () => { if(current) exploreTo(current.node); };
 $("eback").onclick = () => { stack.pop(); drawExplore(); };
 $("ereset").onclick = () => { stack = []; drawExplore(); };
 

@@ -11,7 +11,7 @@
  * Reload button sends "skip". Nothing reloads under a game in progress; left
  * alone, the new worker takes over once every tab has closed.
  */
-const CACHE = "chess-trainer-2026-09-17+99f7a1d";
+const CACHE = "chess-trainer-2026-09-17+a5c11d1";
 const CORE = ["./", "./index.html"];
 
 self.addEventListener("install", e => {
