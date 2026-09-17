@@ -294,6 +294,11 @@
   .note{font-size:12px;color:var(--faint);line-height:1.5;border-left:2px solid var(--line);
     padding-left:10px;margin-top:12px}
   .hidden{display:none !important}
+  .hlist{max-height:264px;overflow-y:auto}
+  .hmoment{border-top:1px solid var(--line);padding:10px 0 2px;margin-top:10px}
+  .hmoment .row{margin-top:8px}
+  #hgraph svg{display:block;width:100%;height:auto}
+  #hgraph .pt{cursor:pointer}
   .prow{display:grid;grid-template-columns:1fr auto;gap:2px 10px;width:100%;text-align:left;
     background:none;border:0;border-radius:8px;color:var(--ink);font:inherit;font-size:13.5px;
     padding:8px 10px;cursor:pointer}
@@ -322,6 +327,7 @@
 
 <nav role="tablist">
   <button role="tab" data-tab="play"    aria-selected="true">Play</button>
+  <button role="tab" data-tab="games"   aria-selected="false">Games</button>
   <button role="tab" data-tab="drill"   aria-selected="false">Repertoire</button>
   <button role="tab" data-tab="explore" aria-selected="false">Explore</button>
   <button role="tab" data-tab="weak"    aria-selected="false">Weak spots</button>
@@ -412,6 +418,48 @@
     <div class="card">
       <h2>Moves</h2>
       <div id="gmoves" class="movelist"></div>
+    </div>
+  </div>
+</section>
+
+<!-- ============ GAMES: history and review ============ -->
+<section id="tab-games" class="cols hidden">
+  <div class="boardwrap">
+    <div class="board" id="hboard"></div>
+    <div class="boardbar">
+      <span class="turn" id="hturn"></span>
+      <div class="row">
+        <button class="btn" id="hback" aria-label="Previous move">&larr;</button>
+        <button class="btn" id="hfwd" aria-label="Next move">&rarr;</button>
+        <button class="btn" id="hflip" title="Flip the board">Flip</button>
+      </div>
+    </div>
+    <div class="card" style="margin-top:14px">
+      <h2>How the game went</h2>
+      <div id="hgraph"></div>
+      <p class="muted" id="hgraphnote" style="margin:8px 0 0"></p>
+    </div>
+  </div>
+  <div>
+    <div class="card">
+      <h2>Your games</h2>
+      <div class="muted" id="hcount" style="margin-bottom:10px"></div>
+      <div id="hlist" class="hlist"></div>
+    </div>
+    <div class="card" id="hcard">
+      <h2 id="htitle">Review</h2>
+      <div id="hsummary"></div>
+      <div id="hmoments"></div>
+      <div class="row" style="margin-top:12px">
+        <button class="btn" id="hcopy">Copy PGN</button>
+        <button class="btn" id="hsave">Download PGN</button>
+        <span class="muted" id="hmsg" role="status"></span>
+      </div>
+      <textarea id="hpgn" class="hidden" readonly aria-label="PGN of this game" rows="6" style="width:100%;margin-top:10px"></textarea>
+    </div>
+    <div class="card" id="hmovescard">
+      <h2>Moves</h2>
+      <div id="hmoves" class="movelist"></div>
     </div>
   </div>
 </section>
@@ -2271,6 +2319,126 @@ return {squareAt, step, squareLabel, describe, sayMove, soundOf, parseEntry, sou
 if(typeof window !== "undefined") window.Feel = Feel;
 if(typeof module !== "undefined" && module.exports) module.exports = Feel;
 </script>
+<script>/* Review: what a finished game looks like afterwards. Everything here is pure —
+ * it reads one logged game record (see logGame in play.js) and returns numbers,
+ * words or text. The Games tab in template.html does the drawing.
+ */
+const Review = (function(){
+"use strict";
+
+const MATE = 90000;                       // Engine.scalar puts mates beyond this
+const clampCp = v => Math.max(-1000, Math.min(1000, v));
+
+/** Chance of winning, 0–100, from a centipawn score for the same side. The
+ *  curve is the one Lichess fitted to real games; a mate is simply the end of it. */
+function winProb(cp){
+  return 50 + 50 * (2 / (1 + Math.exp(-0.00368208 * clampCp(cp))) - 1);
+}
+
+/** How much of your winning chances one move kept, 0–100. `best` and `played`
+ *  are scores for the mover, from the same search. */
+function moveAccuracy(best, played){
+  const drop = Math.max(0, winProb(best) - winProb(played));
+  return Math.max(0, Math.min(100, 103.1668 * Math.exp(-0.04354 * drop) - 3.1669));
+}
+
+/** One number for the game: halfway between the plain mean and the harmonic
+ *  mean, so one thrown queen is not averaged away by thirty quiet moves. */
+function accuracy(pairs){
+  const a = pairs.filter(p => p && Number.isFinite(p.best) && Number.isFinite(p.played))
+                 .map(p => moveAccuracy(p.best, p.played));
+  if(!a.length) return null;
+  const mean = a.reduce((s, x) => s + x, 0) / a.length;
+  const harm = a.length / a.reduce((s, x) => s + 1 / Math.max(x, 1), 0);
+  return Math.round((mean + harm) / 2 * 10) / 10;
+}
+
+/** A score for the graph and the list: "+1.3", "−0.4", "mate in 3". */
+function evalWords(whitePov){
+  if(Math.abs(whitePov) > MATE){
+    const n = Math.max(1, Math.round((100000 - Math.abs(whitePov)) / 100));
+    return `${whitePov > 0 ? "White" : "Black"} mates in ${n}`;
+  }
+  return (whitePov >= 0 ? "+" : "−") + (Math.abs(whitePov) / 100).toFixed(1);
+}
+
+/** Your worst moves, at most `max`, back in the order they were played. */
+function keyMoments(rec, max){
+  const out = [];
+  (rec.losses || []).forEach((loss, ply) => {
+    const tag = rec.tags && rec.tags[ply];
+    if(tag) out.push({ply, san: rec.moves[ply], tag, loss, best: (rec.bests && rec.bests[ply]) || null});
+  });
+  return out.sort((a, b) => b.loss - a.loss).slice(0, max || 3).sort((a, b) => a.ply - b.ply);
+}
+
+/** After each deliberate bot slip: was your reply a sound one? */
+function punished(rec){
+  const out = [];
+  for(const ply of rec.slips || []){
+    const loss = rec.losses && rec.losses[ply + 1];
+    const mated = /#$/.test(rec.moves[ply + 1] || "");   // the move that ends the game is never reviewed
+    if(loss == null && !mated) continue;           // no reply, or one the coach never looked at
+    out.push({ply, slip: rec.moves[ply], reply: rec.moves[ply + 1], ok: !(rec.tags && rec.tags[ply + 1])});
+  }
+  return out;
+}
+
+/* ------------------------------------------------------------ PGN */
+
+const RESULT = (rec) => rec.outcome === "draw" ? "1/2-1/2"
+  : ((rec.outcome === "win") === (rec.mine === "w") ? "1-0" : "0-1");
+const NAG = {blunder: "$4", mistake: "$2", inacc: "$6"};
+
+function pgn(rec){
+  const bot = `${rec.bot} bot (${rec.elo})`;
+  const tags = [
+    ["Event", rec.mode === "coach" ? "Chess Trainer, coached game" : "Chess Trainer, real game"],
+    ["Site", "?"],
+    ["Date", (rec.started || "").slice(0, 10).replace(/-/g, ".") || "????.??.??"],
+    ["Round", "-"],
+    ["White", rec.mine === "w" ? "You" : bot],
+    ["Black", rec.mine === "b" ? "You" : bot],
+    ["Result", RESULT(rec)],
+    ["Termination", rec.why || "?"],
+  ];
+  if(rec.from) tags.push(["Annotator", "replayed from an earlier game"]);
+  const words = [];
+  rec.moves.forEach((san, ply) => {
+    if(ply % 2 === 0) words.push(`${ply / 2 + 1}.`);
+    words.push(san);
+    const tag = rec.tags && rec.tags[ply];
+    if(tag) words.push(NAG[tag]);
+    if((rec.slips || []).includes(ply)) words.push("{bot slip}");
+  });
+  words.push(RESULT(rec));
+  const lines = [];
+  let line = "";
+  for(const w of words){
+    if(line && (line + " " + w).length > 79){ lines.push(line); line = w; }
+    else line = line ? line + " " + w : w;
+  }
+  if(line) lines.push(line);
+  return tags.map(([k, v]) => `[${k} "${String(v).replace(/["\\]/g, "")}"]`).join("\n") + "\n\n" + lines.join("\n") + "\n";
+}
+
+/** Enough of a PGN reader to take back what pgn() wrote (and most simple files). */
+function parsePgn(text){
+  const headers = {};
+  const body = String(text).replace(/^\s*\[(\w+)\s+"([^"]*)"\]\s*$/gm, (_, k, v) => { headers[k] = v; return ""; });
+  const words = body.replace(/\{[^}]*\}/g, " ").replace(/;[^\n]*/g, " ").replace(/\$\d+/g, " ")
+    .split(/\s+/).map(w => w.replace(/^\d+\.(\.\.)?/, "")).filter(Boolean);
+  const results = ["1-0", "0-1", "1/2-1/2", "*"];
+  return {headers, moves: words.filter(w => !results.includes(w)),
+          result: words.find(w => results.includes(w)) || headers.Result || "*"};
+}
+
+return {winProb, moveAccuracy, accuracy, evalWords, keyMoments, punished, pgn, parsePgn, MATE};
+})();
+
+if(typeof window !== "undefined") window.Review = Review;
+if(typeof module !== "undefined" && module.exports) module.exports = Review;
+</script>
 <script>/* The coach. Explains what a move did and what to aim for instead.
  *
  * Deliberately not a scoreboard: the point is to name the idea you missed and
@@ -2376,6 +2544,20 @@ const CLASS = [
 ];
 const classify = loss => CLASS.find(c => loss >= c.min);
 
+/* What a move cost, from two scores for the mover out of the same search. A
+   mate is not a number of pawns: Engine.scalar() puts it near 100000, and the
+   plain difference used to come out as "costs about 993.0 pawns". A slower
+   mate, or a quicker loss when mate was coming anyway, costs nothing. */
+const MATE = 90000;
+const mateIn = v => Math.max(1, Math.round((100000 - Math.abs(v)) / 100));
+function price(best, played){
+  const cap = v => Math.max(-1000, Math.min(1000, v));
+  if((best > MATE && played > MATE) || (best < -MATE && played < -MATE)) return {loss: 0, mate: null};
+  if(played < -MATE) return {loss: cap(best) + 1000, mate: {kind: "allowed", n: mateIn(played)}};
+  if(best > MATE) return {loss: Math.max(0, 1000 - cap(played)), mate: {kind: "missed", n: mateIn(best)}};
+  return {loss: Math.max(0, best - played), mate: null};
+}
+
 /* Not a plain FEN prefix: after 1.e4 the FEN says "e3" and the archive says "-",
    so every position after a double pawn push used to miss its book note. */
 const first4 = fen => new Chess(fen).posKey();
@@ -2479,11 +2661,13 @@ function hintText(fen, best, step){
 }
 
 /** The verdict line for a reviewed move. Pure wording — no engine, no DOM. */
-function verdict(cls, played, bestSan, hang, loss){
+function verdict(cls, played, bestSan, hang, loss, mate){
   if(cls.tag){
     return `<div class="verdict ${cls.tag === "inacc" ? "meh" : "no"}">
       <b>${cls.label}: ${played}</b>` +
-      (hang ? ` — ${hang.san} wins ${hang.lost} points of material.`
+      (mate && mate.kind === "allowed" ? ` — it allows a forced mate in ${mate.n}.`
+       : mate ? ` — there was a forced mate in ${mate.n}, and this lets it go.`
+       : hang ? ` — ${hang.san} wins ${hang.lost} points of material.`
             : ` — it costs about ${(loss/100).toFixed(1)} pawns of position.`) + `</div>`;
   }
   if(bestSan && played === bestSan)
@@ -2548,7 +2732,7 @@ async function review(state, rec){
     replyUci = after.best;
   }
 
-  const loss = Math.max(0, bestEval - playedEval);
+  const {loss, mate} = price(bestEval, playedEval);
   const bestSan = uciToSan(rec.before, cands[0].move);
   const played  = rec.san;
   const cls = classify(loss);
@@ -2562,17 +2746,17 @@ async function review(state, rec){
   /* Order matters. Dropping material is always worth saying, whatever the book
      thinks. Otherwise, inside your own repertoire your results beat a shallow
      engine verdict — that's the difference between teaching and nitpicking. */
-  const book = (hang || loss >= 320) ? null : bookNote(rec, me);
+  const book = (hang || mate || loss >= 320) ? null : bookNote(rec, me);
   if(book){
     let bhtml = book;
     if(tip) bhtml += `<div class="note" style="margin-top:12px">${tip}</div>`;
-    S.notes[ply] = {tag: "", html: bhtml, loss, best: bestSan, book: true,
+    S.notes[ply] = {tag: "", html: bhtml, loss, best: bestSan, top: bestEval, got: playedEval, book: true,
                     hidden: S.mode !== "coach"};
     if(S.mode === "coach") document.getElementById("gcoach").innerHTML = bhtml;
     return;
   }
 
-  let html = verdict(cls, played, bestSan, hang, loss);
+  let html = verdict(cls, played, bestSan, hang, loss, mate);
 
   if(cls.tag && bestSan && bestSan !== played){
     const pvSan = describePv(rec.before, cands[0].pv);
@@ -2584,7 +2768,7 @@ async function review(state, rec){
     if(p.castled) html += `<p class="muted" style="margin:10px 0 0">King safe, pieces coming out — keep going.</p>`;
   }
 
-  S.notes[ply] = {tag: cls.tag, html, loss, best: bestSan};
+  S.notes[ply] = {tag: cls.tag, html, loss, best: bestSan, top: bestEval, got: playedEval};
   if(S.mode !== "coach"){
     // rated games stay quiet until the end
     S.notes[ply].hidden = true;
@@ -2653,13 +2837,16 @@ function gameOver(state){
   if(worst) html += `<p style="margin:8px 0 0">The one that mattered most was
     <b>${worst.html.match(/<b>[^:]*: ([^<]+)<\/b>/)?.[1] || "?"}</b> —
     ${worst.best ? `<b>${worst.best}</b> was the move.` : ""}</p>`;
-  html += `<p class="muted" style="margin:10px 0 0">Click any move in the list to walk back through it.</p>`;
+  const acc = typeof Review !== "undefined" ? Review.accuracy(S.notes.map(n => n && {best: n.top, played: n.got})) : null;
+  if(acc != null) html += `<p style="margin:8px 0 0">Accuracy <b>${acc.toFixed(1)}</b>.</p>`;
+  html += `<p class="muted" style="margin:10px 0 0">Click any move in the list to walk back through it, or open
+    <b>Games</b> for the graph, the key moments and a PGN.</p>`;
   document.getElementById("gcoach").innerHTML = html;
   S.notes.forEach(n => { if(n) n.hidden = false; });
 }
 
 return {reset, review, previewForUser, hint, gameOver, principles, principleTip, fmtEval,
-        CLASS, classify, verdict, fromPov, hangDetail, nudge, hintText};
+        CLASS, classify, price, verdict, fromPov, hangDetail, nudge, hintText};
 })();
 
 /* `const` at top level does not become a window property, and play.js guards on
@@ -2696,6 +2883,7 @@ const S = {
   slips: [],           // plies where the bot deliberately played a worse move
   takebacks: 0,
   id: null, startedAt: null,
+  from: null,          // {id, ply} when this game was replayed out of the history
   cur: null,           // keyboard cursor square, shown only while the board has focus
   premove: null,       // {from, to} queued during the bot's turn (option, off by default)
   ask: null,           // {spec, warn} — a move waiting on "that hangs a piece — sure?"
@@ -2718,7 +2906,7 @@ function readJSON(key, fallback){
   catch(e){ return fallback; }
 }
 function writeJSON(key, v){
-  try { localStorage.setItem(key, JSON.stringify(v)); } catch(e){ /* full or blocked */ }
+  try { localStorage.setItem(key, JSON.stringify(v)); return true; } catch(e){ return false; /* full or blocked */ }
 }
 
 const uciOf = m => m.from + m.to + (m.promotion || "");
@@ -2730,7 +2918,7 @@ function persist(){
     id: S.id, startedAt: S.startedAt, mine: S.mine, flip: S.flip,
     moves: S.game.history().map(uciOf), notes: S.notes, evals: S.evals,
     slips: S.slips, takebacks: S.takebacks, hints: S.hints, nudges: S.nudges,
-    over: S.over, started: S.started}});
+    from: S.from, over: S.over, started: S.started}});
 }
 
 /** Rebuild a saved game by replaying it; anything that doesn't replay is dropped. */
@@ -2750,6 +2938,7 @@ function restore(g){
   S.slips.forEach(i => { if(h[i]) h[i].slipped = true; });
   S.takebacks = +g.takebacks || 0; S.hints = +g.hints || 0; S.nudges = +g.nudges || 0;
   S.ask = null; S.tip = null;
+  S.from = g.from && typeof g.from === "object" ? g.from : null;
   S.over = typeof g.over === "string" ? g.over : null;
   S.started = !!g.started || n > 0;
   S.id = g.id || newId(); S.startedAt = g.startedAt || new Date().toISOString();
@@ -2770,11 +2959,45 @@ function logGame(outcome, why){
     plies: S.game.history().length, moves: S.game.history().map(m => m.san),
     slips: S.slips.slice(), counts, takebacks: S.takebacks, hints: S.hints, nudges: S.nudges,
     build: (typeof BUILD !== "undefined" ? BUILD : "dev")};
+  // what the Games tab reviews from: one slot per ply, null where nothing was judged
+  const per = f => entry.moves.map((_, i) => { const n = S.notes[i]; return n && f(n) != null ? f(n) : null; });
+  entry.losses = per(n => Number.isFinite(n.loss) ? Math.round(n.loss) : null);
+  entry.tags = per(n => n.tag || null);
+  entry.bests = per(n => n.best);
+  entry.evals = entry.moves.map((_, i) => Number.isFinite(S.evals[i]) ? Math.round(S.evals[i]) : null);
+  entry.acc = window.Review ? Review.accuracy(S.notes.map(n => n && {best: n.top, played: n.got})) : null;
+  if(S.from) entry.from = S.from;      // a replay, not a fresh game: calibration should skip it
   let all = readJSON(GAMES, []);
   if(!Array.isArray(all)) all = [];
   all = all.filter(g => g && g.id !== S.id);
   all.push(entry);
-  writeJSON(GAMES, all.slice(-MAX_GAMES));
+  all = all.slice(-MAX_GAMES);
+  // storage full: let the oldest games go rather than lose this one
+  while(!writeJSON(GAMES, all) && all.length > 1) all = all.slice(Math.ceil(all.length / 4));
+}
+
+const games = () => { const all = readJSON(GAMES, []); return Array.isArray(all) ? all.filter(g => g && Array.isArray(g.moves)) : []; };
+
+/* Key moments: put a logged game back on the board as it stood before `ply`
+   and play on from there against the same bot. It is a new game with its own
+   id; `from` marks it as a replay so it is never mistaken for a fresh result. */
+function replayFrom(rec, ply){
+  const game = new Chess();
+  for(const san of rec.moves.slice(0, ply)) if(!game.move(san)) return false;
+  if(game.isGameOver() || game.turn() !== rec.mine) return false;
+  S.gen++; Engine.stop();
+  if(Engine.LEVELS[rec.level]) setLevel(rec.level);
+  setMode("coach");
+  sidePref = rec.mine;
+  document.querySelectorAll("#gsides [data-side]").forEach(b =>
+    b.classList.toggle("primary", b.dataset.side === sidePref));
+  restore({moves: game.history().map(uciOf), mine: rec.mine, flip: rec.mine === "b",
+           id: newId(), startedAt: new Date().toISOString(), started: true, from: {id: rec.id, ply}});
+  shown = -1; $("gpromo").classList.add("hidden");
+  if(window.Coach) Coach.reset(S);
+  persist(); draw(); showNote();
+  if(window.Coach) Coach.previewForUser(S);
+  return true;
 }
 
 /* ------------------------------------------------------------ board */
@@ -3149,7 +3372,7 @@ function newGame(){
   S.started = false; S.thinking = false; S.pending = null;
   S.reviewing = false; S.stalled = false; S.slips = []; S.takebacks = 0;
   S.premove = null; S.cur = null; shown = -1;
-  S.ask = null; S.tip = null; S.hints = 0; S.nudges = 0;
+  S.ask = null; S.tip = null; S.hints = 0; S.nudges = 0; S.from = null;
   S.flip = S.mine === "b";
   S.id = newId(); S.startedAt = new Date().toISOString();
   $("gpromo").classList.add("hidden");
@@ -3356,7 +3579,7 @@ function init(){
 let booted = false;
 return {
   show(){ if(!booted){ booted = true; init(); } Engine.boot(); },
-  state: S, draw, showNote, hint, retry,
+  state: S, draw, showNote, hint, retry, games, replayFrom,
 };
 })();
 
@@ -3585,7 +3808,7 @@ window.Log = Log;
 </script>
 
 <script>
-const BUILD = "2026-09-17+82191cc";
+const BUILD = "2026-09-17+7a87415";
 const DATA = {"me":"","white":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"black":{"start":"rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq -","pos":{}},"habits":null,"puzzles":[],"patterns":null};
 
 /* ============================ board rendering ============================ */
@@ -4245,10 +4468,189 @@ function redrawAll(){
     if(!$("tab-explore").classList.contains("hidden")) drawExplore();
     if(pId) pDraw();
   } catch(e){ /* board not built yet */ }
+  if(hId && !$("tab-games").classList.contains("hidden")) hDraw();
 }
 
 /* ============================ shell ============================ */
 const REP_SIDES ="#tab-drill [data-side], #tab-explore [data-side], #tab-weak [data-side]";
+
+/* ============================ games ============================ */
+/* History and review of finished bot games. The records come from Play.games()
+   (localStorage, this browser only); the numbers and words from js/review.js. */
+let hGames = [], hId = null, hPly = 0, hFlip = false, hLine = null, hArmed = null;
+const hRec = () => hGames.find(g => g.id === hId);
+const H_OUT = {win: "Won", loss: "Lost", draw: "Drew"};
+const H_TAG = {blunder: "blunder", mistake: "mistake", inacc: "inaccuracy"};
+const hCount = (n, one, many) => `${n} ${n === 1 ? one : many || one + "s"}`;
+
+/** Replay the logged SAN once per game: positions and from/to squares per ply. */
+function hReplay(rec){
+  if(hLine && hLine.id === rec.id) return hLine;
+  const g = new Chess(), fens = [g.fen()], mv = [];
+  for(const san of rec.moves){
+    const m = g.move(san);
+    if(!m) break;
+    fens.push(m.after); mv.push(m);
+  }
+  return hLine = {id: rec.id, fens, mv};
+}
+
+function hTitle(rec){
+  return `${H_OUT[rec.outcome] || "Played"} against ${rec.bot} (${rec.elo}) as ${rec.mine === "w" ? "White" : "Black"}`;
+}
+
+function drawGames(){
+  hGames = Play.games().reverse();
+  const none = !hGames.length;
+  $("hcount").textContent = none
+    ? "No finished games yet. Play one through — win, lose or resign — and it is kept here, in this browser only."
+    : `${hGames.length} finished game${hGames.length === 1 ? "" : "s"}, newest first. Kept in this browser only.`;
+  for(const id of ["hcard", "hmovescard"]) $(id).classList.toggle("hidden", none);
+  if(none){ $("hlist").innerHTML = ""; $("hgraph").innerHTML = ""; $("hgraphnote").textContent = "";
+    $("hturn").textContent = ""; renderBoard($("hboard"), new Chess().fen()); return; }
+  if(!hRec()) { hId = hGames[0].id; hPly = hGames[0].moves.length; hFlip = hGames[0].mine === "b"; }
+  $("hlist").innerHTML = hGames.map(g => {
+    const when = new Date(g.ended || g.started);
+    const day = isNaN(when) ? "" : when.toLocaleDateString(undefined, {day: "numeric", month: "short", year: "numeric"}) + " · ";
+    return `<button class="prow ${g.id === hId ? "on" : ""}" data-game="${esc(g.id)}">
+      <span>${esc(hTitle(g))}</span>
+      <span class="pn">${g.acc != null ? "accuracy " + g.acc.toFixed(1) : ""}</span>
+      <span class="muted" style="grid-column:1 / -1">${day}${hCount(Math.ceil(g.moves.length / 2), "move")} · ${esc(g.why || "")} ·
+        ${g.mode === "coach" ? "coached" : "real game"}${g.from ? " · replay" : ""}</span></button>`;
+  }).join("");
+  $("hlist").querySelectorAll("[data-game]").forEach(b => b.onclick = () => {
+    const g = hGames.find(x => x.id === b.dataset.game);
+    hId = g.id; hPly = g.moves.length; hFlip = g.mine === "b"; hArmed = null; drawGames();
+  });
+  hSummary(); hDraw();
+}
+
+function hSummary(){
+  const rec = hRec(), c = rec.counts || {blunder: 0, mistake: 0, inacc: 0};
+  $("htitle").textContent = hTitle(rec);
+  $("hpgn").classList.add("hidden"); $("hmsg").textContent = "";
+  let html = `<div class="verdict ${rec.outcome === "win" ? "ok" : "meh"}"><b>${H_OUT[rec.outcome] || "Finished"} by ${esc(rec.why || "?")}</b>` +
+    ` after ${hCount(Math.ceil(rec.moves.length / 2), "move")}.</div>`;
+  html += rec.acc != null
+    ? `<p style="margin:0 0 8px"><b>Accuracy ${rec.acc.toFixed(1)}</b> — how much of your winning chances your moves kept, ` +
+      `move by move. 100 is the engine's choice every time; one thrown piece pulls it down hard.</p>`
+    : `<p class="muted" style="margin:0 0 8px">No accuracy for this game — ${rec.losses ? "too few of your moves were looked at" : "it was played before reviews were kept"}.</p>`;
+  const bold = s => s.replace(/^\d+/, "<b>$&</b>");
+  html += `<p style="margin:0 0 8px">${bold(hCount(c.blunder, "blunder"))}, ${bold(hCount(c.mistake, "mistake"))}, ` +
+    `${bold(hCount(c.inacc, "inaccuracy", "inaccuracies"))}` +
+    (rec.takebacks ? ` · ${rec.takebacks} taken back` : "") + (rec.hints ? ` · ${hCount(rec.hints, "hint")}` : "") + `.</p>`;
+  const slips = Review.punished(rec);
+  if(slips.length){
+    const kept = slips.filter(x => x.ok).length;
+    html += `<p style="margin:0 0 8px">The bot played a deliberately weak move ${slips.length} time${slips.length === 1 ? "" : "s"}; ` +
+      `you answered ${kept} of them with a sound move` +
+      (kept < slips.length ? ` — and gave the chance back after ${slips.filter(x => !x.ok).map(x =>
+        `<button class="mply" data-hply="${x.ply + 1}" style="display:inline;width:auto;padding:0 2px;text-decoration:underline">${esc(x.slip)}</button>`).join(", ")}` : "") + `.</p>`;
+  } else if((rec.slips || []).length === 0 && rec.losses){
+    html += `<p class="muted" style="margin:0 0 8px">The bot made no deliberate slips in this game.</p>`;
+  }
+  $("hsummary").innerHTML = html;
+
+  const km = Review.keyMoments(rec, 3);
+  $("hmoments").innerHTML = km.map(k => `<div class="hmoment">
+      <b>Move ${Math.floor(k.ply / 2) + 1}, ${esc(k.san)}</b> — ${H_TAG[k.tag]}.` +
+      (k.best && k.best !== k.san ? ` <b>${esc(k.best)}</b> was the move.` : "") +
+      `<div class="row"><button class="btn" data-hply="${k.ply}">Show the position</button>
+       <button class="btn" data-hretry="${k.ply}">${hArmed === k.ply ? "Replace the game in progress?" : "Try again from here"}</button></div></div>`).join("") ||
+    (rec.losses ? `<p class="muted" style="margin:10px 0 0">No key moments — nothing the coach would call an inaccuracy or worse.</p>` : "");
+  $("hcard").querySelectorAll("[data-hply]").forEach(b => b.onclick = () => { hPly = +b.dataset.hply; hDraw(); });
+  $("hcard").querySelectorAll("[data-hretry]").forEach(b => b.onclick = () => {
+    const ply = +b.dataset.hretry;
+    Play.show();                                       // boots the Play tab if it has not been opened yet
+    const busy = Play.state.started && !Play.state.over;
+    if(busy && hArmed !== ply){ hArmed = ply; hSummary(); return; }
+    hArmed = null;
+    if(Play.replayFrom(rec, ply)) show("play");
+    else { $("hmsg").textContent = "That position could not be set up."; hSummary(); }
+  });
+}
+
+function hDraw(){
+  const rec = hRec(), L = hReplay(rec), n = L.mv.length;
+  hPly = Math.max(0, Math.min(n, hPly));
+  const last = hPly > 0 ? L.mv[hPly - 1] : null, hl = {};
+  if(last){ hl[last.from] = "from"; hl[last.to] = "to"; }
+  renderBoard($("hboard"), L.fens[hPly], {flip: hFlip, highlight: hl});
+  const tag = last && rec.tags && rec.tags[hPly - 1], best = last && rec.bests && rec.bests[hPly - 1];
+  const ev = last && rec.evals && rec.evals[hPly - 1];
+  $("hturn").innerHTML = !last ? "<b>Start of the game</b>" :
+    `<b>${Math.floor((hPly - 1) / 2) + 1}${hPly % 2 ? "." : "…"} ${esc(last.san)}</b>` +
+    (tag ? ` — ${H_TAG[tag]}${best && best !== last.san ? `, ${esc(best)} was the move` : ""}` : "") +
+    ((rec.slips || []).includes(hPly - 1) ? " — a deliberate bot slip" : "") +
+    (ev != null ? ` <span class="muted">(${Review.evalWords(ev)})</span>` : "");
+  $("hback").disabled = hPly === 0; $("hfwd").disabled = hPly === n;
+
+  const rows = [];
+  for(let i = 0; i < n; i += 2){
+    const cell = j => L.mv[j] ? `<button class="mply ${hPly === j + 1 ? "on" : ""}" data-hply="${j + 1}">${esc(L.mv[j].san)}` +
+      (rec.tags && rec.tags[j] ? `<i class="dot ${rec.tags[j]}"></i>` : "") + `</button>` : `<span class="mply"></span>`;
+    rows.push(`<div class="mrow"><span class="mno">${i / 2 + 1}.</span>${cell(i)}${cell(i + 1)}</div>`);
+  }
+  $("hmoves").innerHTML = rows.join("");
+  $("hmoves").querySelectorAll("[data-hply]").forEach(b => b.onclick = () => { hPly = +b.dataset.hply; hDraw(); });
+  const on = $("hmoves").querySelector(".mply.on");
+  if(on) $("hmoves").scrollTop = Math.max(0, on.offsetTop - $("hmoves").offsetTop - 90);
+  hGraph(rec);
+}
+
+/** The score after each of your moves, from White's side, ±8 pawns; a mate sits on the edge. */
+function hGraph(rec){
+  const pts = (rec.evals || []).map((v, ply) => v == null ? null : {ply, v}).filter(Boolean);
+  if(pts.length < 2){
+    $("hgraph").innerHTML = "";
+    $("hgraphnote").textContent = rec.evals ? "Too few of your moves were looked at to draw the game."
+                                            : "This game was played before scores were kept, so there is nothing to draw.";
+    return;
+  }
+  const W = 720, H = 170, ml = 8, mr = 8, mt = 10, mb = 10, n = rec.moves.length;
+  const X = ply => ml + (ply + 1) / n * (W - ml - mr);
+  const Y = v => mt + (800 - Math.max(-800, Math.min(800, v))) / 1600 * (H - mt - mb);
+  const line = pts.map((p, i) => (i ? "L" : "M") + X(p.ply).toFixed(1) + " " + Y(p.v).toFixed(1)).join(" ");
+  const area = `${line} L${X(pts[pts.length - 1].ply).toFixed(1)} ${Y(0)} L${X(pts[0].ply).toFixed(1)} ${Y(0)} Z`;
+  const COL = {blunder: "var(--bad)", mistake: "#e08a5a", inacc: "var(--warn)"};
+  let s = `<title>${esc("Score after each of your moves, from White's side: " +
+    pts.filter((p, i) => i % Math.ceil(pts.length / 12) === 0 || i === pts.length - 1)
+       .map(p => `move ${Math.floor(p.ply / 2) + 1} ${Review.evalWords(p.v)}`).join(", "))}</title>
+    <rect x="${ml}" y="${mt}" width="${W - ml - mr}" height="${H - mt - mb}" fill="var(--panel2)" rx="6"/>
+    <path d="${area}" fill="${C_UP}" fill-opacity=".18"/>
+    <line x1="${ml}" x2="${W - mr}" y1="${Y(0)}" y2="${Y(0)}" stroke="var(--line)" stroke-width="1.5"/>
+    <path d="${line}" fill="none" stroke="${C_UP}" stroke-width="2" stroke-linejoin="round" stroke-linecap="round"/>`;
+  if(hPly > 0) s += `<line x1="${X(hPly - 1).toFixed(1)}" x2="${X(hPly - 1).toFixed(1)}" y1="${mt}" y2="${H - mb}" stroke="var(--ink)" stroke-opacity=".45" stroke-width="1.5"/>`;
+  for(const p of pts){
+    const tag = rec.tags && rec.tags[p.ply];
+    s += `<circle class="pt" data-hply="${p.ply + 1}" cx="${X(p.ply).toFixed(1)}" cy="${Y(p.v).toFixed(1)}" r="${tag ? 5 : 3}"
+      fill="${tag ? COL[tag] : C_UP}" stroke="var(--panel)" stroke-width="1.5"><title>${esc(
+      `${Math.floor(p.ply / 2) + 1}. ${rec.moves[p.ply]}: ${Review.evalWords(p.v)}${tag ? " — " + H_TAG[tag] : ""}`)}</title></circle>`;
+  }
+  $("hgraph").innerHTML = svg(`0 0 ${W} ${H}`, s);
+  $("hgraph").querySelectorAll("[data-hply]").forEach(c => c.onclick = () => { hPly = +c.dataset.hply; hDraw(); });
+  $("hgraphnote").textContent = "Above the line White is better, below it Black. Each dot is one of your moves; " +
+    "the coloured ones are the moves the coach flagged. Click a dot to go there.";
+}
+
+$("hback").onclick = () => { hPly--; hDraw(); };
+$("hfwd").onclick = () => { hPly++; hDraw(); };
+$("hflip").onclick = () => { hFlip = !hFlip; hDraw(); };
+$("hcopy").onclick = async () => {
+  const text = Review.pgn(hRec());
+  try { await navigator.clipboard.writeText(text); $("hmsg").textContent = "PGN copied."; }
+  catch(e){   // clipboard is blocked on file:// in some browsers; fall back to a box to copy from
+    const ta = $("hpgn"); ta.classList.remove("hidden"); ta.value = text; ta.focus(); ta.select();
+    $("hmsg").textContent = "Select all and copy from the box below.";
+  }
+};
+$("hsave").onclick = () => {
+  const rec = hRec(), a = document.createElement("a");
+  a.href = URL.createObjectURL(new Blob([Review.pgn(rec)], {type: "application/x-chess-pgn"}));
+  a.download = `chess-trainer-${(rec.started || "").slice(0, 10)}-${rec.id}.pgn`;
+  a.click();
+  $("hmsg").textContent = "PGN downloaded.";
+};
 
 /* The Log needs the tab you were on when the problem happened, not "Log". */
 let lastTab = "play";
@@ -4266,6 +4668,7 @@ document.querySelectorAll("nav button").forEach(b => b.onclick = () => {
   if(b.dataset.tab === "habits") drawHabits();
   if(b.dataset.tab === "puzzles") drawPuzzles();
   if(b.dataset.tab === "play") Play.show();
+  if(b.dataset.tab === "games") drawGames();
   if(b.dataset.tab === "log") Log.show();
 });
 
